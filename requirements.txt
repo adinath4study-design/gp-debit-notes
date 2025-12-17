@@ -1,0 +1,6 @@
+streamlit
+pandas
+fpdf
+gspread
+google-auth
+google-api-python-client
