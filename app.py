@@ -8,464 +8,436 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from streamlit_option_menu import option_menu
-from streamlit_lottie import st_lottie
 import requests
-import zipfile
-import io
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION & ASSETS ---
 COMPANY_NAME = "G P Group"
 LOGO_PATH = "logo.png"
 
-# --- ASSETS & ANIMATIONS ---
-def load_lottieurl(url: str):
-    try:
-        r = requests.get(url)
-        if r.status_code != 200: return None
-        return r.json()
-    except: return None
-
-lottie_login = load_lottieurl("https://assets4.lottiefiles.com/packages/lf20_jcikwtux.json")
-lottie_success = load_lottieurl("https://assets9.lottiefiles.com/packages/lf20_lk80fpsm.json")
-
-# --- GOOGLE CONNECTION ---
+# --- 2. GOOGLE SERVICES (BACKEND) ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
-def get_google_creds():
-    creds_dict = st.secrets["gcp_service_account"]
-    return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+def get_creds():
+    return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
 
 def get_sheet_client():
-    return gspread.authorize(get_google_creds())
+    return gspread.authorize(get_creds())
 
 def get_drive_service():
-    return build('drive', 'v3', credentials=get_google_creds())
+    return build('drive', 'v3', credentials=get_creds())
 
-def upload_file_to_drive(file_path, filename, mime_type):
-    drive_service = get_drive_service()
+def upload_to_drive(file_path, filename, mime_type):
+    """Uploads file to Google Drive (Shared Drive compatible)"""
+    service = get_drive_service()
     folder_id = st.secrets["drive_settings"]["folder_id"]
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype=mime_type)
-    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+    file = service.files().create(
+        body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
+    ).execute()
     return file.get('webViewLink')
 
-# --- DATABASE FUNCTIONS ---
+# --- 3. DATABASE OPERATIONS (CRUD) ---
 def init_db():
     try:
         client = get_sheet_client()
         sh = client.open_by_url(st.secrets["drive_settings"]["sheet_url"])
-        try: sh.worksheet("DebitNotes")
-        except:
-            ws = sh.add_worksheet("DebitNotes", 1000, 10)
-            ws.append_row(["ID", "Contractor Name", "Date", "Amount", "Reason", "Site Location", "Image Links", "PDF Link", "SubmittedBy"])
-        try: sh.worksheet("Contractors")
-        except:
-            ws = sh.add_worksheet("Contractors", 100, 2)
-            ws.append_row(["ID", "Name"])
-        try: sh.worksheet("Users")
-        except:
-            ws = sh.add_worksheet("Users", 50, 3)
-            ws.append_row(["Username", "Password", "Role"])
-    except Exception as e: st.error(f"DB Error: {e}")
+        
+        # Ensure tables exist with correct headers
+        tables = {
+            "DebitNotes": ["ID", "Contractor Name", "Date", "Amount", "Reason", "Site Location", "Image Links", "PDF Link", "SubmittedBy"],
+            "Contractors": ["ID", "Name", "Details"],
+            "Users": ["Username", "Password", "Role"]
+        }
+        for name, headers in tables.items():
+            try: sh.worksheet(name)
+            except: 
+                ws = sh.add_worksheet(name, 100, len(headers))
+                ws.append_row(headers)
+    except Exception as e: st.error(f"Database Error: {e}")
 
-def get_users():
-    client = get_sheet_client()
-    return client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Users").get_all_records()
+def db_get(table):
+    return pd.DataFrame(get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table).get_all_records())
 
-def add_user_db(username, password, role):
-    client = get_sheet_client()
-    ws = client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Users")
-    if ws.find(username): return False
-    ws.append_row([username, password, role])
-    return True
+def db_insert(table, row_data):
+    ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
+    ws.append_row(row_data)
 
-def manage_user(action, username, new_password=None):
-    client = get_sheet_client()
-    ws = client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Users")
-    cell = ws.find(username)
-    if not cell: return False
-    if action == "delete": ws.delete_rows(cell.row)
-    elif action == "update_pass": ws.update_cell(cell.row, 2, new_password)
-    return True
+def db_delete(table, col_name, value):
+    ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
+    try:
+        cell = ws.find(str(value))
+        ws.delete_rows(cell.row)
+        return True
+    except: return False
 
-def save_debit_note(data):
-    client = get_sheet_client()
-    ws = client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("DebitNotes")
-    note_id = int(datetime.now().timestamp())
-    ws.append_row([
-        note_id, data['contractor'], data['date'], data['amount'], 
-        data['reason'], data['site'], data['img_links'], data['pdf_link'],
-        st.session_state['username']
-    ])
+def db_update_cell(table, search_val, col_idx, new_val):
+    ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
+    try:
+        cell = ws.find(str(search_val))
+        ws.update_cell(cell.row, col_idx, new_val)
+        return True
+    except: return False
 
-def get_all_notes():
-    client = get_sheet_client()
-    ws = client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("DebitNotes")
-    return pd.DataFrame(ws.get_all_records())
-
-def get_contractors():
-    client = get_sheet_client()
-    ws = client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Contractors")
-    return [r['Name'] for r in ws.get_all_records()]
-
-def add_contractor(name):
-    client = get_sheet_client()
-    ws = client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Contractors")
-    if name in ws.col_values(2): return False
-    ws.append_row([len(ws.col_values(2)), name])
-    return True
-
-# --- PDF GENERATOR CLASS ---
+# --- 4. PDF ENGINE ---
 class PDF(FPDF):
     def header(self):
-        if os.path.exists(LOGO_PATH): self.image(LOGO_PATH, 10, 8, 33)
-        self.set_font('Arial', 'B', 15)
-        self.cell(80)
-        self.cell(30, 10, COMPANY_NAME, 0, 0, 'C')
-        self.ln(20)
-        self.line(10, 30, 200, 30)
+        if os.path.exists(LOGO_PATH): self.image(LOGO_PATH, 10, 8, 30)
+        self.set_font('Helvetica', 'B', 20)
+        self.set_text_color(50, 50, 50)
+        self.cell(0, 15, COMPANY_NAME, 0, 1, 'C')
         self.ln(10)
-    
+        
     def footer(self):
         self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.cell(0, 10, f'Generated by {st.session_state.get("username", "System")} on {datetime.now().strftime("%Y-%m-%d")}', 0, 0, 'C')
+        self.set_font('Helvetica', 'I', 8)
+        self.set_text_color(150)
+        self.cell(0, 10, f'Generated by {st.session_state.get("username", "System")} on {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 0, 'C')
 
-# --- PDF FUNCTION 1: SINGLE DEBIT NOTE (Receipt) ---
-def generate_single_receipt(data):
+def create_pdf(type, data):
     if not os.path.exists("temp"): os.makedirs("temp")
     pdf = PDF()
     pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "DEBIT NOTE RECEIPT", ln=True, align='C')
+    
+    # Header Styling
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_fill_color(240, 240, 240)
+    title = "DEBIT NOTE" if type == "receipt" else "STATEMENT OF ACCOUNT"
+    pdf.cell(0, 12, title, 0, 1, 'C', fill=True)
     pdf.ln(10)
     
-    pdf.set_font("Arial", size=12)
-    def row(l, v):
-        pdf.set_font("Arial", "B", 12); pdf.cell(50, 10, l, 1)
-        pdf.set_font("Arial", size=12); pdf.cell(140, 10, str(v), 1, 1)
+    if type == "receipt":
+        # Card-like details
+        pdf.set_font("Helvetica", "", 12)
+        fields = [
+            ("Contractor", data['contractor']),
+            ("Date", str(data['date'])),
+            ("Site Location", data['site']),
+            ("Amount", f"INR {data['amount']}")
+        ]
         
-    row("Contractor", data['contractor'])
-    row("Date", data['date'])
-    row("Location", data['site'])
-    row("Amount", f"INR {data['amount']}")
-    row("Issued By", st.session_state['username'])
-    
-    pdf.set_font("Arial", "B", 12); pdf.cell(50, 20, "Reason", 1)
-    pdf.set_font("Arial", size=12); pdf.multi_cell(140, 20, data['reason'], 1)
-    pdf.ln(5)
-    
-    if data['local_img_paths']:
-        pdf.cell(0, 10, "Site Photos:", ln=True)
-        for p in data['local_img_paths']:
-            if os.path.exists(p): pdf.image(p, w=80); pdf.ln(5)
+        for label, value in fields:
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(50, 10, label, "B")
+            pdf.set_font("Helvetica", "", 12)
+            pdf.cell(140, 10, str(value), "B", 1)
             
-    path = f"temp/Receipt_{int(datetime.now().timestamp())}.pdf"
+        pdf.ln(10)
+        pdf.set_font("Helvetica", "B", 12); pdf.cell(0, 10, "Description / Reason:", 0, 1)
+        pdf.set_font("Helvetica", "", 11); pdf.multi_cell(0, 8, data['reason'])
+        
+        if data.get('local_img_paths'):
+            pdf.ln(10)
+            pdf.set_font("Helvetica", "B", 12); pdf.cell(0, 10, "Proof of Deduction:", 0, 1)
+            for p in data['local_img_paths']:
+                if os.path.exists(p): 
+                    try: pdf.image(p, w=100); pdf.ln(5)
+                    except: pass
+        filename = f"DebitNote_{int(datetime.now().timestamp())}.pdf"
+
+    else: # Statement
+        pdf.set_font("Helvetica", "", 12)
+        pdf.cell(0, 8, f"Contractor: {data['contractor']}", 0, 1)
+        pdf.cell(0, 8, f"Period: {data['start']} to {data['end']}", 0, 1)
+        pdf.ln(5)
+        
+        # Table Header
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_fill_color(50, 50, 50); pdf.set_text_color(255)
+        pdf.cell(30, 10, "Date", 1, 0, 'C', True)
+        pdf.cell(100, 10, "Reason", 1, 0, 'C', True)
+        pdf.cell(30, 10, "Amount", 1, 0, 'C', True)
+        pdf.cell(30, 10, "User", 1, 1, 'C', True)
+        
+        # Table Body
+        pdf.set_text_color(0); pdf.set_font("Helvetica", "", 9)
+        total = 0
+        for _, row in data['df'].iterrows():
+            pdf.cell(30, 10, str(row['Date']), 1)
+            pdf.cell(100, 10, str(row['Reason'])[:55], 1)
+            pdf.cell(30, 10, str(row['Amount']), 1)
+            pdf.cell(30, 10, str(row['SubmittedBy']), 1, 1)
+            total += float(row['Amount'])
+            
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(130, 10, "Total Deductions:", 0, 0, 'R')
+        pdf.cell(60, 10, f"INR {total}", 0, 1, 'L')
+        filename = f"Statement_{data['contractor']}.pdf"
+
+    path = f"temp/{filename}"
     pdf.output(path)
     return path
 
-# --- PDF FUNCTION 2: STATEMENT OF ACCOUNT (Master) ---
-def generate_statement_of_account(contractor, start_date, end_date, df):
-    if not os.path.exists("temp"): os.makedirs("temp")
-    pdf = PDF()
-    pdf.add_page()
-    
-    # Title
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "STATEMENT OF ACCOUNT", ln=True, align='C')
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 10, f"Contractor: {contractor}", ln=True, align='C')
-    pdf.cell(0, 10, f"Period: {start_date} to {end_date}", ln=True, align='C')
-    pdf.ln(10)
-    
-    # Table Header
-    pdf.set_font("Arial", "B", 10)
-    pdf.cell(25, 8, "Date", 1)
-    pdf.cell(85, 8, "Reason / Description", 1)
-    pdf.cell(25, 8, "Amount", 1)
-    pdf.cell(30, 8, "Issued By", 1)
-    pdf.cell(25, 8, "Note ID", 1, 1)
-    
-    # Table Content
-    pdf.set_font("Arial", size=9)
-    total = 0
-    
-    # Filter rows for this contractor only
-    con_df = df[df['Contractor Name'] == contractor]
-    
-    for _, r in con_df.iterrows():
-        try:
-            pdf.cell(25, 8, str(r['Date']), 1)
-            pdf.cell(85, 8, str(r['Reason'])[:45], 1) # Truncate long text
-            pdf.cell(25, 8, str(r['Amount']), 1)
-            pdf.cell(30, 8, str(r.get('SubmittedBy', 'N/A')), 1)
-            pdf.cell(25, 8, str(r['ID']), 1, 1)
-            total += float(r['Amount'])
-        except: continue
-            
-    pdf.ln(5)
-    # Total Box
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(110, 10, "Total Debit Amount:", 1, 0, 'R')
-    pdf.cell(80, 10, f"INR {total}", 1, 1)
-    
-    # Save
-    filename = f"Statement_{contractor}_{datetime.now().strftime('%Y%m%d')}.pdf"
-    path = os.path.join("temp", filename)
-    pdf.output(path)
-    return path
-
-# --- THEMES & CSS ---
+# --- 5. THEME ENGINE ---
 THEMES = {
-    "Corporate Blue": {"primary": "#0F52BA", "bg": "#f8f9fa", "card": "#ffffff", "text": "#212529"},
-    "Dark Mode": {"primary": "#bb86fc", "bg": "#121212", "card": "#1e1e1e", "text": "#e0e0e0"},
-    "Construction Site": {"primary": "#f4a261", "bg": "#fff1e6", "card": "#ffffff", "text": "#264653"},
-    "Forest": {"primary": "#2a9d8f", "bg": "#e9edc9", "card": "#fefae0", "text": "#283618"},
-    "Minimal Grey": {"primary": "#6c757d", "bg": "#f8f9fa", "card": "#ffffff", "text": "#343a40"}
+    "Corporate Blue": {
+        "bg": "#f4f6f9", "card": "rgba(255, 255, 255, 0.9)", "text": "#1e293b", "primary": "#0F52BA", "accent": "#3b82f6"
+    },
+    "Dark Mode": {
+        "bg": "#0f172a", "card": "rgba(30, 41, 59, 0.8)", "text": "#f8fafc", "primary": "#3b82f6", "accent": "#60a5fa"
+    },
+    "Industrial": {
+        "bg": "#292524", "card": "rgba(68, 64, 60, 0.9)", "text": "#fafaf9", "primary": "#f59e0b", "accent": "#fbbf24"
+    },
+    "Forest": {
+        "bg": "#ecfdf5", "card": "rgba(255, 255, 255, 0.8)", "text": "#064e3b", "primary": "#059669", "accent": "#34d399"
+    },
+    "High Contrast": {
+        "bg": "#ffffff", "card": "#ffffff", "text": "#000000", "primary": "#000000", "accent": "#000000"
+    }
 }
 
-def apply_css(theme_name):
+def inject_css(theme_name):
     t = THEMES[theme_name]
     st.markdown(f"""
-        <style>
+    <style>
         .stApp {{ background-color: {t['bg']}; color: {t['text']}; }}
-        .css-card {{
-            background-color: {t['card']};
-            border-radius: 12px;
-            padding: 25px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-            border-left: 6px solid {t['primary']};
-            color: {t['text']};
+        .glass-card {{
+            background: {t['card']}; backdrop-filter: blur(10px);
+            border-radius: 16px; padding: 24px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1); margin-bottom: 24px;
         }}
         .stButton>button {{
-            background-color: {t['primary']} !important;
-            color: white !important;
-            border-radius: 8px;
-            height: 3em;
-            border: none;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
-            transition: all 0.3s;
+            background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%);
+            color: white; border: none; padding: 10px 24px; border-radius: 8px; font-weight: 600; width: 100%;
         }}
-        .stButton>button:hover {{ transform: translateY(-2px); box-shadow: 0 6px 8px rgba(0,0,0,0.3); }}
-        input, select, textarea {{ border-radius: 8px !important; border: 1px solid #ced4da !important; }}
+        .stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] {{
+            border-radius: 8px; border: 1px solid {t['primary']}40;
+        }}
         h1, h2, h3 {{ color: {t['text']} !important; }}
-        </style>
+    </style>
     """, unsafe_allow_html=True)
 
-def card_start(): st.markdown('<div class="css-card">', unsafe_allow_html=True)
+def card_start(): st.markdown('<div class="glass-card">', unsafe_allow_html=True)
 def card_end(): st.markdown('</div>', unsafe_allow_html=True)
 
-# --- MAIN APP FLOW ---
+# --- 6. MAIN APP ---
 def main():
-    st.set_page_config(page_title="G P Group", page_icon="🏗️", layout="wide")
+    st.set_page_config(page_title="GP Group Portal", page_icon="🏗️", layout="wide")
     
-    # Init State
+    # Init Session
     if 'theme' not in st.session_state: st.session_state['theme'] = "Corporate Blue"
-    if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
+    if 'auth' not in st.session_state: st.session_state['auth'] = False
     
-    apply_css(st.session_state['theme'])
-    if 'db_checked' not in st.session_state: init_db(); st.session_state['db_checked'] = True
+    inject_css(st.session_state['theme'])
+    if 'db_init' not in st.session_state: init_db(); st.session_state['db_init'] = True
 
-    # --- LOGIN ---
-    if not st.session_state['logged_in']:
-        col1, col2, col3 = st.columns([1, 1.5, 1])
-        with col2:
+    # --- AUTH ---
+    if not st.session_state['auth']:
+        c1, c2, c3 = st.columns([1,1,1])
+        with c2:
             card_start()
-            if lottie_login: st_lottie(lottie_login, height=150, key="login_anim")
             st.title("G P Portal Login")
-            
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            if st.button("Secure Login"):
-                client = get_sheet_client()
-                ws = client.open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Users")
-                records = ws.get_all_records()
-                found = False
-                for u in records:
-                    if str(u['Username']) == str(username) and str(u['Password']) == str(password):
-                        st.session_state['logged_in'] = True
-                        st.session_state['role'] = u['Role']
-                        st.session_state['username'] = username
-                        st.rerun()
-                        found = True
-                if not found: st.error("Access Denied")
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            if st.button("Login"):
+                users = db_get("Users")
+                match = users[(users['Username'].astype(str)==u) & (users['Password'].astype(str)==p)]
+                if not match.empty:
+                    st.session_state['auth'] = True
+                    st.session_state['role'] = match.iloc[0]['Role']
+                    st.session_state['username'] = u
+                    st.rerun()
+                else: st.error("Invalid Credentials")
             card_end()
-            st.session_state['theme'] = st.selectbox("Select Theme", list(THEMES.keys()))
         return
 
-    # --- NAVIGATION ---
+    # --- TOP BAR ---
+    col_logo, col_space, col_user = st.columns([1, 4, 2])
+    with col_logo:
+        if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=120)
+    with col_user:
+        with st.expander(f"👤 {st.session_state['username']} ({st.session_state['role']})"):
+            if st.button("Logout"): st.session_state['auth'] = False; st.rerun()
+            st.session_state['theme'] = st.selectbox("Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(st.session_state['theme']))
+
+    # --- SIDEBAR ---
     with st.sidebar:
-        if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=150)
-        st.markdown(f"### 👤 {st.session_state['username']}")
-        st.caption(f"Role: {st.session_state['role']}")
+        st.title("Navigation")
+        opts = ["Dashboard", "Raise Debit Note"]
+        icons = ["grid-fill", "file-earmark-plus-fill"]
         
-        # Theme Switcher
-        new_theme = st.selectbox("🎨 App Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(st.session_state['theme']))
-        if new_theme != st.session_state['theme']: st.session_state['theme'] = new_theme; st.rerun()
-
-        # Menu
-        opts = ["Raise Debit Note", "Dashboard", "Logout"]
-        icons = ["clipboard-plus", "search", "door-open"]
         if st.session_state['role'] == "Admin":
-            opts[2:2] = ["User Management", "Manage Contractors"]
-            icons[2:2] = ["person-badge", "cone-striped"]
+            opts += ["Contractors", "User Management"]
+            icons += ["building-fill", "people-fill"]
             
-        selected = option_menu("Menu", opts, icons=icons, menu_icon="list", 
-                               styles={"nav-link-selected": {"background-color": THEMES[st.session_state['theme']]['primary']}})
+        sel = option_menu("Menu", opts, icons=icons, styles={"nav-link-selected": {"background-color": THEMES[st.session_state['theme']]['primary']}})
 
-    if selected == "Logout":
-        st.session_state['logged_in'] = False; st.rerun()
-
-    # --- 1. RAISE DEBIT NOTE (Instant Receipt) ---
-    if selected == "Raise Debit Note":
-        col1, col2 = st.columns([2, 1])
-        with col1: st.title("Raise Debit Note")
+    # --- DASHBOARD ---
+    if sel == "Dashboard":
+        st.title("Dashboard")
+        df = db_get("DebitNotes")
         
+        # Search & Filter
         card_start()
-        with st.form("debit_form"):
+        c1, c2, c3 = st.columns(3)
+        search = c1.text_input("Search Contractor")
+        
+        # Sort & Filter Logic
+        if not df.empty:
+            df['Date'] = pd.to_datetime(df['Date'])
+            min_d, max_d = df['Date'].min().date(), df['Date'].max().date()
+            dr = c2.date_input("Date Range", [min_d, max_d])
+            sort_order = c3.selectbox("Sort", ["Date (Desc)", "Date (Asc)"])
+            
+            # Apply Filters
+            if search: df = df[df['Contractor Name'].str.contains(search, case=False)]
+            if len(dr) == 2: df = df[(df['Date'].dt.date >= dr[0]) & (df['Date'].dt.date <= dr[1])]
+            df = df.sort_values(by="Date", ascending=(sort_order == "Date (Asc)"))
+        card_end()
+
+        # Recent Activity
+        st.subheader("Recent Activity")
+        if not df.empty:
+            st.dataframe(df.head(5)[['Date', 'Contractor Name', 'Amount', 'Reason', 'SubmittedBy']], use_container_width=True)
+        else: st.info("No records found.")
+
+        # Master PDF Button
+        st.markdown("---")
+        if st.button("📄 Generate Account Statement"):
+            st.session_state['show_gen'] = True
+            
+        if st.session_state.get('show_gen'):
+            card_start()
+            st.subheader("Generate Statement")
+            if not df.empty:
+                mc = st.selectbox("Select Contractor", df['Contractor Name'].unique())
+                mdr = st.date_input("Period", [])
+                if st.button("Confirm & Download"):
+                    if len(mdr) == 2:
+                        mask = (df['Contractor Name'] == mc) & (df['Date'].dt.date >= mdr[0]) & (df['Date'].dt.date <= mdr[1])
+                        f_df = df[mask]
+                        if not f_df.empty:
+                            path = create_pdf("statement", {"contractor": mc, "start": mdr[0], "end": mdr[1], "df": f_df})
+                            with open(path, "rb") as f:
+                                st.download_button("Download PDF", f, file_name=os.path.basename(path))
+                        else: st.warning("No data for selection.")
+                    st.session_state['show_gen'] = False
+            card_end()
+
+    # --- RAISE DEBIT NOTE ---
+    elif sel == "Raise Debit Note":
+        st.title("Raise Debit Note")
+        card_start()
+        with st.form("raise_form"):
+            cons = db_get("Contractors")
+            c_list = cons['Name'].tolist() if not cons.empty else []
+            
             c1, c2 = st.columns(2)
-            con_list = get_contractors()
-            contractor = c1.selectbox("Contractor", con_list) if con_list else c1.selectbox("None", [])
-            date_val = c2.date_input("Date")
+            con = c1.selectbox("Contractor", c_list)
+            dt = c2.date_input("Date")
             
             c3, c4 = st.columns(2)
-            site = c3.text_input("Location")
-            amount = c4.number_input("Amount", min_value=0.0)
-            reason = st.text_area("Reason")
-            files = st.file_uploader("Evidence Photos", accept_multiple_files=True)
+            site = c3.text_input("Site Location")
+            amt = c4.number_input("Amount (INR)", min_value=0.0)
             
-            submitted = st.form_submit_button("Generate Debit Note")
+            reason = st.text_area("Description / Reason")
+            files = st.file_uploader("Proof (Image)", accept_multiple_files=True)
             
-            if submitted and site and reason:
-                # 1. Process Images
-                imgs = []
-                links = []
+            if st.form_submit_button("Submit & Generate"):
+                # Upload Images
+                imgs, links = [], []
                 if files:
-                    if not os.path.exists("temp"): os.makedirs("temp")
                     for f in files:
+                        if not os.path.exists("temp"): os.makedirs("temp")
                         p = f"temp/{f.name}"
                         with open(p, "wb") as w: w.write(f.getbuffer())
                         imgs.append(p)
-                        links.append(upload_file_to_drive(p, f.name, f.type))
+                        links.append(upload_to_drive(p, f.name, f.type))
                 
-                # 2. Generate PDF Receipt
-                data = {"contractor": contractor, "date": str(date_val), "amount": amount, "reason": reason, "site": site, "local_img_paths": imgs}
-                pdf_path = generate_single_receipt(data) # <--- FEATURE 1
-                pdf_link = upload_file_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
+                # Create Data Dict
+                data = {"contractor": con, "date": str(dt), "amount": amt, "reason": reason, "site": site, "local_img_paths": imgs}
                 
-                # 3. Save to DB
-                save_debit_note({**data, "img_links": ",".join(links), "pdf_link": pdf_link})
+                # Generate PDF & Upload
+                pdf_path = create_pdf("receipt", data)
+                pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
                 
-                st_lottie(lottie_success, height=150, key="success") if lottie_success else None
-                st.success("Debit Note Generated & Saved!")
-                st.markdown(f"[View Receipt PDF]({pdf_link})")
+                # Save to DB
+                db_insert("DebitNotes", [
+                    int(datetime.now().timestamp()), con, str(dt), amt, reason, site, 
+                    ",".join(links), pdf_link, st.session_state['username']
+                ])
+                
+                st.success("Debit Note Raised Successfully!")
+                with open(pdf_path, "rb") as f:
+                    st.download_button("Download Receipt", f, file_name=os.path.basename(pdf_path))
         card_end()
 
-    # --- 2. DASHBOARD (Statement of Account) ---
-    elif selected == "Dashboard":
-        st.title("Records & Reports")
-        df = get_all_notes()
+    # --- ADMIN: CONTRACTORS ---
+    elif sel == "Contractors" and st.session_state['role'] == "Admin":
+        st.title("Contractor Management")
+        c1, c2 = st.columns([1, 2])
         
-        # --- STATEMENT GENERATOR ---
-        card_start()
-        st.subheader("📑 Statement of Account")
-        c1, c2 = st.columns(2)
-        all_cons = df['Contractor Name'].unique().tolist() if not df.empty else []
-        sel_cons = c1.multiselect("Select Contractor(s)", all_cons, default=all_cons)
-        
-        if not df.empty:
-            df['Date'] = pd.to_datetime(df['Date'])
-            d_rng = c2.date_input("Select Date Range", [df['Date'].min().date(), df['Date'].max().date()])
+        with c1:
+            card_start()
+            st.subheader("Manage")
+            tab1, tab2, tab3 = st.tabs(["Add", "Delete", "View"])
             
-            if len(d_rng) == 2:
-                 # Filter Data
-                mask = (df['Contractor Name'].isin(sel_cons)) & (df['Date'].dt.date >= d_rng[0]) & (df['Date'].dt.date <= d_rng[1])
-                f_df = df[mask]
-                
-                st.markdown("---")
-                if st.button("Generate Statements (PDF)"):
-                    if f_df.empty:
-                        st.warning("No records found for this selection.")
-                    else:
-                        # FEATURE 2: Separate Statement Logic
-                        if len(sel_cons) == 1:
-                            # SINGLE CONTRACTOR -> Download 1 PDF
-                            pdf_path = generate_statement_of_account(sel_cons[0], str(d_rng[0]), str(d_rng[1]), f_df)
-                            with open(pdf_path, "rb") as f:
-                                st.download_button(f"Download Statement for {sel_cons[0]}", f, file_name=os.path.basename(pdf_path))
-                        else:
-                            # MULTIPLE CONTRACTORS -> Download ZIP of PDFs
-                            zip_buffer = io.BytesIO()
-                            with zipfile.ZipFile(zip_buffer, "w") as zf:
-                                for con in sel_cons:
-                                    try:
-                                        p_path = generate_statement_of_account(con, str(d_rng[0]), str(d_rng[1]), f_df)
-                                        zf.write(p_path, os.path.basename(p_path))
-                                    except: pass
-                            
-                            st.success(f"Generated statements for {len(sel_cons)} contractors.")
-                            st.download_button(
-                                label="📦 Download All Statements (ZIP)",
-                                data=zip_buffer.getvalue(),
-                                file_name=f"Statements_Batch_{datetime.now().strftime('%Y%m%d')}.zip",
-                                mime="application/zip"
-                            )
-        card_end()
-        
-        # --- TABLE VIEW ---
-        if not df.empty:
-            st.subheader("Live Database")
-            st.dataframe(df[['Date', 'Contractor Name', 'Amount', 'Reason', 'SubmittedBy', 'PDF Link']], use_container_width=True)
+            with tab1:
+                with st.form("add_con"):
+                    n = st.text_input("Name")
+                    d = st.text_input("Details")
+                    if st.form_submit_button("Add"):
+                        db_insert("Contractors", [int(datetime.now().timestamp()), n, d])
+                        st.success("Added"); st.rerun()
+            
+            with tab2:
+                df_c = db_get("Contractors")
+                if not df_c.empty:
+                    to_del = st.selectbox("Select to Delete", df_c['Name'])
+                    if st.button("Delete Contractor", type="primary"):
+                        db_delete("Contractors", "Name", to_del)
+                        st.warning("Deleted"); st.rerun()
+            card_end()
+
+        with c2:
+            card_start()
+            st.subheader("Contractor List")
+            st.dataframe(db_get("Contractors"), use_container_width=True)
+            card_end()
 
     # --- ADMIN: USERS ---
-    elif selected == "User Management" and st.session_state['role'] == "Admin":
-        st.title("User Controls")
-        col_l, col_r = st.columns(2)
+    elif sel == "User Management" and st.session_state['role'] == "Admin":
+        st.title("User Management")
+        c1, c2 = st.columns(2)
         
-        with col_l:
+        with c1:
             card_start()
-            st.subheader("➕ Add User")
-            with st.form("add"):
+            st.subheader("Add User")
+            with st.form("add_u"):
                 u = st.text_input("Username")
                 p = st.text_input("Password", type="password")
                 r = st.selectbox("Role", ["Engineer", "Admin"])
-                if st.form_submit_button("Create User"):
-                    if add_user_db(u, p, r): st.success("Created"); st.rerun()
-                    else: st.error("User exists")
+                if st.form_submit_button("Create"):
+                    db_insert("Users", [u, p, r])
+                    st.success("User Created"); st.rerun()
             card_end()
-            
-        with col_r:
-            card_start()
-            st.subheader("✏️ Manage Users")
-            users = pd.DataFrame(get_users())
-            if not users.empty:
-                target_u = st.selectbox("Select User", users['Username'].tolist())
-                action = st.radio("Action", ["Change Password", "Delete User"])
-                if action == "Change Password":
-                    new_pass = st.text_input("New Password", type="password")
-                    if st.button("Update Password"):
-                        manage_user("update_pass", target_u, new_password=new_pass)
-                        st.success("Updated!")
-                else:
-                    if st.button("DELETE USER", type="primary"):
-                        manage_user("delete", target_u)
-                        st.warning("Deleted"); st.rerun()
-            card_end()
-        st.table(users)
 
-    # --- ADMIN: CONTRACTORS ---
-    elif selected == "Manage Contractors" and st.session_state['role'] == "Admin":
-        st.title("Contractor List")
-        c1, c2 = st.columns([1, 2])
-        with c1:
+        with c2:
             card_start()
-            st.subheader("Add New")
-            n = st.text_input("Name")
-            if st.button("Add"):
-                if add_contractor(n): st.success("Added"); st.rerun()
+            st.subheader("Manage Users")
+            users = db_get("Users")
+            if not users.empty:
+                target = st.selectbox("Select User", users['Username'])
+                act = st.radio("Action", ["Delete", "Update Role"])
+                
+                if act == "Delete":
+                    if st.button("Delete User", type="primary"):
+                        db_delete("Users", "Username", target)
+                        st.warning("Deleted"); st.rerun()
+                else:
+                    nr = st.selectbox("New Role", ["Engineer", "Admin"])
+                    if st.button("Update Role"):
+                        # Column 3 is Role (index 3 in Sheets API 1-based)
+                        db_update_cell("Users", target, 3, nr)
+                        st.success("Updated"); st.rerun()
             card_end()
-        with c2: st.table(get_contractors())
+        
+        card_start()
+        st.dataframe(users, use_container_width=True)
+        card_end()
 
 if __name__ == "__main__":
     main()
