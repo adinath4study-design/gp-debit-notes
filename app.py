@@ -336,4 +336,66 @@ def main():
             
             c3, c4 = st.columns(2)
             site = c3.text_input("Site Location")
-            amt = c4.number_input("Amount (
+            amt = c4.number_input("Amount (INR)", min_value=0.0)
+            
+            reason = st.text_area("Description / Reason")
+            files = st.file_uploader("Proof (Image)", accept_multiple_files=True)
+            
+            submitted = st.form_submit_button("Submit & Generate")
+            
+            if submitted:
+                # Upload Images
+                imgs, links = [], []
+                if files:
+                    for f in files:
+                        if not os.path.exists("temp"): os.makedirs("temp")
+                        p = f"temp/{f.name}"
+                        with open(p, "wb") as w: w.write(f.getbuffer())
+                        imgs.append(p)
+                        links.append(upload_to_drive(p, f.name, f.type))
+                
+                # Create Data Dict
+                data = {"contractor": con, "date": str(dt), "amount": amt, "reason": reason, "site": site, "local_img_paths": imgs}
+                
+                # Generate PDF & Upload
+                pdf_path = create_pdf("receipt", data)
+                pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
+                
+                # Save to DB
+                db_insert("DebitNotes", [
+                    int(datetime.now().timestamp()), con, str(dt), amt, reason, site, 
+                    ",".join(links), pdf_link, st.session_state['username']
+                ])
+                
+                # Save path to session state
+                st.session_state['latest_pdf_path'] = pdf_path
+                st.success("Debit Note Raised Successfully!")
+        
+        # Render Download Button OUTSIDE the Form
+        if st.session_state['latest_pdf_path']:
+            st.markdown("---")
+            with open(st.session_state['latest_pdf_path'], "rb") as f:
+                st.download_button(
+                    label="📥 Download Receipt PDF",
+                    data=f,
+                    file_name=os.path.basename(st.session_state['latest_pdf_path']),
+                    mime="application/pdf"
+                )
+        card_end()
+
+    # --- ADMIN: CONTRACTORS ---
+    elif sel == "Contractors" and st.session_state['role'] == "Admin":
+        st.title("Contractor Management")
+        c1, c2 = st.columns([1, 2])
+        
+        with c1:
+            card_start()
+            st.subheader("Manage")
+            tab1, tab2, tab3 = st.tabs(["Add", "Delete", "View"])
+            
+            with tab1:
+                with st.form("add_con"):
+                    n = st.text_input("Name")
+                    d = st.text_input("Details")
+                    if st.form_submit_button("Add"):
+                        db_insert("Contractors", [int(datetime.now().timestamp()), n
