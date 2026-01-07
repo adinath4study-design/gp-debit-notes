@@ -317,10 +317,15 @@ def main():
                     st.session_state['show_gen'] = False
             card_end()
 
-    # --- RAISE DEBIT NOTE ---
+    # --- RAISE DEBIT NOTE (FIXED) ---
     elif sel == "Raise Debit Note":
         st.title("Raise Debit Note")
         card_start()
+        
+        # Initialize Memory Slot
+        if 'latest_pdf_path' not in st.session_state:
+            st.session_state['latest_pdf_path'] = None
+
         with st.form("raise_form"):
             cons = db_get("Contractors")
             c_list = cons['Name'].tolist() if not cons.empty else []
@@ -331,113 +336,4 @@ def main():
             
             c3, c4 = st.columns(2)
             site = c3.text_input("Site Location")
-            amt = c4.number_input("Amount (INR)", min_value=0.0)
-            
-            reason = st.text_area("Description / Reason")
-            files = st.file_uploader("Proof (Image)", accept_multiple_files=True)
-            
-            if st.form_submit_button("Submit & Generate"):
-                # Upload Images
-                imgs, links = [], []
-                if files:
-                    for f in files:
-                        if not os.path.exists("temp"): os.makedirs("temp")
-                        p = f"temp/{f.name}"
-                        with open(p, "wb") as w: w.write(f.getbuffer())
-                        imgs.append(p)
-                        links.append(upload_to_drive(p, f.name, f.type))
-                
-                # Create Data Dict
-                data = {"contractor": con, "date": str(dt), "amount": amt, "reason": reason, "site": site, "local_img_paths": imgs}
-                
-                # Generate PDF & Upload
-                pdf_path = create_pdf("receipt", data)
-                pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
-                
-                # Save to DB
-                db_insert("DebitNotes", [
-                    int(datetime.now().timestamp()), con, str(dt), amt, reason, site, 
-                    ",".join(links), pdf_link, st.session_state['username']
-                ])
-                
-                st.success("Debit Note Raised Successfully!")
-                with open(pdf_path, "rb") as f:
-                    st.download_button("Download Receipt", f, file_name=os.path.basename(pdf_path))
-        card_end()
-
-    # --- ADMIN: CONTRACTORS ---
-    elif sel == "Contractors" and st.session_state['role'] == "Admin":
-        st.title("Contractor Management")
-        c1, c2 = st.columns([1, 2])
-        
-        with c1:
-            card_start()
-            st.subheader("Manage")
-            tab1, tab2, tab3 = st.tabs(["Add", "Delete", "View"])
-            
-            with tab1:
-                with st.form("add_con"):
-                    n = st.text_input("Name")
-                    d = st.text_input("Details")
-                    if st.form_submit_button("Add"):
-                        db_insert("Contractors", [int(datetime.now().timestamp()), n, d])
-                        st.success("Added"); st.rerun()
-            
-            with tab2:
-                df_c = db_get("Contractors")
-                if not df_c.empty:
-                    to_del = st.selectbox("Select to Delete", df_c['Name'])
-                    if st.button("Delete Contractor", type="primary"):
-                        db_delete("Contractors", "Name", to_del)
-                        st.warning("Deleted"); st.rerun()
-            card_end()
-
-        with c2:
-            card_start()
-            st.subheader("Contractor List")
-            st.dataframe(db_get("Contractors"), use_container_width=True)
-            card_end()
-
-    # --- ADMIN: USERS ---
-    elif sel == "User Management" and st.session_state['role'] == "Admin":
-        st.title("User Management")
-        c1, c2 = st.columns(2)
-        
-        with c1:
-            card_start()
-            st.subheader("Add User")
-            with st.form("add_u"):
-                u = st.text_input("Username")
-                p = st.text_input("Password", type="password")
-                r = st.selectbox("Role", ["Engineer", "Admin"])
-                if st.form_submit_button("Create"):
-                    db_insert("Users", [u, p, r])
-                    st.success("User Created"); st.rerun()
-            card_end()
-
-        with c2:
-            card_start()
-            st.subheader("Manage Users")
-            users = db_get("Users")
-            if not users.empty:
-                target = st.selectbox("Select User", users['Username'])
-                act = st.radio("Action", ["Delete", "Update Role"])
-                
-                if act == "Delete":
-                    if st.button("Delete User", type="primary"):
-                        db_delete("Users", "Username", target)
-                        st.warning("Deleted"); st.rerun()
-                else:
-                    nr = st.selectbox("New Role", ["Engineer", "Admin"])
-                    if st.button("Update Role"):
-                        # Column 3 is Role (index 3 in Sheets API 1-based)
-                        db_update_cell("Users", target, 3, nr)
-                        st.success("Updated"); st.rerun()
-            card_end()
-        
-        card_start()
-        st.dataframe(users, use_container_width=True)
-        card_end()
-
-if __name__ == "__main__":
-    main()
+            amt = c4.number_input("Amount (
