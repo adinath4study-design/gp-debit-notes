@@ -5,5 +5,5 @@ gspread
 google-auth
 google-api-python-client
 streamlit-option-menu
-streamlit-lottie
-requests
+SpeechRecognition
+streamlit-mic-recorder
