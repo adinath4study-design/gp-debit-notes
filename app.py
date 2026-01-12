@@ -105,7 +105,7 @@ def init_db():
         for name, headers in tables.items():
             try: 
                 ws = sh.worksheet(name)
-                # Auto-Add Missing Columns
+                # Auto-Add Missing Columns logic
                 curr = ws.row_values(1)
                 if len(curr) < len(headers):
                     ws.resize(cols=len(headers))
@@ -116,8 +116,23 @@ def init_db():
                 ws.append_row(headers)
     except Exception as e: st.error(f"Database Error: {e}")
 
+# --- UPDATED CRASH-PROOF DB_GET ---
 def db_get(table):
-    return pd.DataFrame(get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table).get_all_records())
+    try:
+        ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
+        data = ws.get_all_values()
+        
+        # If sheet is empty or only has headers
+        if len(data) < 2: 
+            return pd.DataFrame(columns=data[0] if data else None)
+        
+        headers = data[0]
+        rows = data[1:]
+        return pd.DataFrame(rows, columns=headers)
+    except Exception as e:
+        # Graceful fallback instead of crashing
+        st.error(f"Error reading {table}: {e}")
+        return pd.DataFrame()
 
 def db_insert(table, row_data):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
