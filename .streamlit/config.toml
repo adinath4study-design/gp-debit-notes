@@ -3,7 +3,6 @@ enableCORS = false
 enableXsrfProtection = false
 maxUploadSize = 500
 enableWebsocketCompression = false
-maxMessageSize = 500  # <--- NEW: Increases the internal buffer
 
 [browser]
 gatherUsageStats = false
