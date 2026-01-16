@@ -2,6 +2,8 @@
 enableCORS = false
 enableXsrfProtection = false
 maxUploadSize = 500
+enableWebsocketCompression = false
 
 [browser]
 gatherUsageStats = false
+serverAddress = "0.0.0.0"
