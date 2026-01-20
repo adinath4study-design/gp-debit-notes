@@ -4,6 +4,7 @@ fpdf
 gspread
 google-auth
 google-api-python-client
-streamlit-option-menu
+streamlit-drawable-canvas
+pillow
 SpeechRecognition
 streamlit-mic-recorder
