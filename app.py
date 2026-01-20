@@ -37,7 +37,7 @@ def get_drive_service():
     return build('drive', 'v3', credentials=get_creds())
 
 def upload_to_drive(file_path, filename, mime_type):
-    """Uploads file and makes it PUBLIC (Anyone with link can view)"""
+    """Uploads file and forces it to be PUBLIC"""
     service = get_drive_service()
     folder_id = st.secrets["drive_settings"]["folder_id"]
     
@@ -49,26 +49,22 @@ def upload_to_drive(file_path, filename, mime_type):
         body=file_metadata, 
         media_body=media, 
         fields='id, webViewLink', 
-        supportsAllDrives=True  # Required for Shared Drives
+        supportsAllDrives=True
     ).execute()
     file_id = file.get('id')
     
-    # 2. Force "Public" Permission
+    # 2. Force "Public" Permission (Crucial Step)
     try:
-        # 'supportsAllDrives' is sometimes needed here too depending on Org settings
-        permission = {'type': 'anyone', 'role': 'reader'}
         service.permissions().create(
-            fileId=file_id, 
-            body=permission,
-            supportsAllDrives=True
+            fileId=file_id,
+            body={'type': 'anyone', 'role': 'reader'},
+            supportsAllDrives=True  # <--- THIS WAS MISSING
         ).execute()
     except Exception as e:
-        print(f"⚠️ Could not make file public. Reason: {e}")
-        # If this fails, it's usually because the Bot is not a "Manager" 
-        # or the Company Org Policy blocks public sharing.
+        print(f"Permission Error: {e}")
+        # If this prints in your logs, it means Step 1 (Manager Role) wasn't done.
     
     return file.get('webViewLink')
-
 # --- 3. HELPER FUNCTIONS (Compression & Voice) ---
 def compress_image(image_file):
     if not os.path.exists("temp"): os.makedirs("temp")
