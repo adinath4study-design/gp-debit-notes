@@ -44,18 +44,28 @@ def upload_to_drive(file_path, filename, mime_type):
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype=mime_type)
     
-    # 1. Upload
+    # 1. Upload the file
     file = service.files().create(
-        body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
+        body=file_metadata, 
+        media_body=media, 
+        fields='id, webViewLink', 
+        supportsAllDrives=True  # Required for Shared Drives
     ).execute()
     file_id = file.get('id')
     
-    # 2. Change Permission to 'Anyone with link' (Reader) - NEW FEATURE
+    # 2. Force "Public" Permission
     try:
+        # 'supportsAllDrives' is sometimes needed here too depending on Org settings
         permission = {'type': 'anyone', 'role': 'reader'}
-        service.permissions().create(fileId=file_id, body=permission).execute()
+        service.permissions().create(
+            fileId=file_id, 
+            body=permission,
+            supportsAllDrives=True
+        ).execute()
     except Exception as e:
-        print(f"Permission Error: {e}") 
+        print(f"⚠️ Could not make file public. Reason: {e}")
+        # If this fails, it's usually because the Bot is not a "Manager" 
+        # or the Company Org Policy blocks public sharing.
     
     return file.get('webViewLink')
 
@@ -321,40 +331,92 @@ def main():
         else: st.caption("No recent alerts")
 
     # --- DASHBOARD ---
+   # --- DASHBOARD ---
     if sel == "Dashboard":
         st.title("Dashboard")
         df = db_get("DebitNotes")
         cons = db_get("Contractors")
         
+        # 1. High Level Metrics
         if not df.empty:
             df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total", f"₹{df['Amount'].sum():,.0f}"); m2.metric("Count", len(df)); m3.metric("Last", df['Date'].max())
+            m1.metric("Total Deductions", f"₹{df['Amount'].sum():,.0f}")
+            m2.metric("Total Notes", len(df))
+            m3.metric("Last Update", df['Date'].max() if not df.empty else "-")
 
+            # 2. Charts
             c1, c2 = st.columns(2)
-            with c1: card_start(); st.subheader("Category Breakdown"); st.bar_chart(df.groupby('Category')['Amount'].sum() if 'Category' in df.columns else []); card_end()
-            with c2: card_start(); st.subheader("Top Contractors"); st.bar_chart(df.groupby('Contractor Name')['Amount'].sum()); card_end()
+            with c1:
+                card_start()
+                st.subheader("Category Breakdown")
+                if 'Category' in df.columns:
+                    st.bar_chart(df.groupby('Category')['Amount'].sum(), color=THEMES[st.session_state['theme']]['primary'])
+                card_end()
+            with c2:
+                card_start()
+                st.subheader("Top Contractors")
+                st.bar_chart(df.groupby('Contractor Name')['Amount'].sum(), color=THEMES[st.session_state['theme']]['accent'])
+                card_end()
 
+        # 3. Search & Filter
         card_start()
         c1, c2 = st.columns([2, 1])
         con_options = ["All"] + cons['Name'].tolist() if not cons.empty else ["All"]
-        search_con = c1.selectbox("Filter", con_options)
+        search_con = c1.selectbox("Filter Contractor", con_options)
+        
         if not df.empty:
             if search_con != "All": df = df[df['Contractor Name'] == search_con]
             df = df.sort_values(by="Date", ascending=False)
         card_end()
 
+        # 4. Recent Activity
         st.subheader("Recent Activity")
         if not df.empty:
             for i, row in df.head(5).iterrows():
-                card_start(); rc1, rc2, rc3 = st.columns([2, 1, 1])
-                with rc1: st.markdown(f"**{row['Contractor Name']}**"); st.caption(f"{row.get('Category', '-')} • {row['Date']}")
+                card_start()
+                rc1, rc2, rc3 = st.columns([2, 1, 1])
+                with rc1:
+                    st.markdown(f"**{row['Contractor Name']}**")
+                    st.caption(f"{row.get('Category', '-')} • {row['Date']}")
                 with rc2: st.markdown(f"**₹ {row['Amount']}**")
-                with rc3: 
-                    # PUBLIC PDF LINK VIEW
+                with rc3:
                     if str(row['PDF Link']).startswith('http'): st.link_button("View PDF", row['PDF Link'])
                 card_end()
         else: st.info("No records.")
+
+        # --- 5. MASTER PDF BUTTON (RESTORED) ---
+        st.markdown("---")
+        if st.button("📄 Generate Account Statement"):
+            st.session_state['show_gen'] = True
+            
+        if st.session_state.get('show_gen'):
+            card_start()
+            st.subheader("Generate Statement")
+            if not df.empty:
+                # Filter Options
+                mc = st.selectbox("Select Contractor", df['Contractor Name'].unique())
+                mdr = st.date_input("Select Period", [])
+                
+                if st.button("Confirm & Download PDF"):
+                    if len(mdr) == 2:
+                        # Filter Data for Statement
+                        mask = (df['Contractor Name'] == mc) & (pd.to_datetime(df['Date']).dt.date >= mdr[0]) & (pd.to_datetime(df['Date']).dt.date <= mdr[1])
+                        f_df = df[mask]
+                        
+                        if not f_df.empty:
+                            # Generate Statement PDF
+                            path = create_pdf("statement", {"contractor": mc, "start": mdr[0], "end": mdr[1], "df": f_df})
+                            with open(path, "rb") as f:
+                                st.download_button("📥 Download Statement", f, file_name=os.path.basename(path))
+                        else:
+                            st.warning("No records found for this period.")
+                    else:
+                        st.warning("Please select a valid start and end date.")
+            if st.button("Close"): 
+                st.session_state['show_gen'] = False
+                st.rerun()
+            card_end()
 
     # --- RAISE DEBIT NOTE ---
     elif sel == "Raise Debit Note":
