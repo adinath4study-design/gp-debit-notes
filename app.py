@@ -18,6 +18,8 @@ import speech_recognition as sr
 from streamlit_mic_recorder import mic_recorder
 import io
 from PIL import Image
+from streamlit_drawable_canvas import st_canvas
+import numpy as np
 
 # --- 1. CONFIGURATION ---
 COMPANY_NAME = "G P Group"
@@ -44,28 +46,22 @@ def upload_to_drive(file_path, filename, mime_type):
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype=mime_type)
     
-    # 1. Upload the file
     file = service.files().create(
-        body=file_metadata, 
-        media_body=media, 
-        fields='id, webViewLink', 
-        supportsAllDrives=True
+        body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
     ).execute()
     file_id = file.get('id')
     
-    # 2. Force "Public" Permission (Crucial Step)
     try:
         service.permissions().create(
             fileId=file_id,
             body={'type': 'anyone', 'role': 'reader'},
-            supportsAllDrives=True  # <--- THIS WAS MISSING
+            supportsAllDrives=True
         ).execute()
-    except Exception as e:
-        print(f"Permission Error: {e}")
-        # If this prints in your logs, it means Step 1 (Manager Role) wasn't done.
+    except: pass
     
     return file.get('webViewLink')
-# --- 3. HELPER FUNCTIONS (Compression & Voice) ---
+
+# --- 3. HELPER FUNCTIONS ---
 def compress_image(image_file):
     if not os.path.exists("temp"): os.makedirs("temp")
     img = Image.open(image_file)
@@ -80,6 +76,23 @@ def compress_image(image_file):
     img.save(filepath, "JPEG", quality=65, optimize=True)
     return filepath
 
+def process_signature(canvas_data):
+    """Converts signature canvas array to an image file"""
+    if canvas_data is None: return None
+    if not os.path.exists("temp"): os.makedirs("temp")
+    
+    # Convert numpy array to image
+    img = Image.fromarray(canvas_data.astype('uint8'), 'RGBA')
+    
+    # Check if blank (all pixels are transparent or white)
+    # Simple check: if alpha channel is all 0, it's empty
+    alpha = img.split()[-1]
+    if alpha.getextrema()[1] == 0: return None
+
+    path = f"temp/sig_{int(datetime.now().timestamp())}.png"
+    img.save(path, "PNG")
+    return path
+
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
     audio_file = io.BytesIO(audio_bytes)
@@ -92,11 +105,13 @@ def send_email_with_pdf(to_emails, subject, body, attachment_path):
     if not to_emails or "email_settings" not in st.secrets: return False
     sender_email = st.secrets["email_settings"]["sender_email"]
     password = st.secrets["email_settings"]["app_password"]
+    
     msg = MIMEMultipart()
     msg['From'] = sender_email
     msg['To'] = ", ".join(to_emails)
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
+    
     if attachment_path and os.path.exists(attachment_path):
         with open(attachment_path, "rb") as attachment:
             part = MIMEBase("application", "octet-stream")
@@ -104,12 +119,14 @@ def send_email_with_pdf(to_emails, subject, body, attachment_path):
         encoders.encode_base64(part)
         part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(attachment_path)}")
         msg.attach(part)
+        
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls(); server.login(sender_email, password)
         server.sendmail(sender_email, to_emails, msg.as_string())
         server.quit(); return True
-    except: return False
+    except Exception as e: 
+        print(e); return False
 
 # --- 5. DATABASE OPERATIONS ---
 def init_db():
@@ -153,13 +170,7 @@ def db_delete(table, col_name, value):
         cell = ws.find(str(value)); ws.delete_rows(cell.row); return True
     except: return False
 
-def db_update_cell(table, search_val, col_idx, new_val):
-    ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
-    try:
-        cell = ws.find(str(search_val)); ws.update_cell(cell.row, col_idx, new_val); return True
-    except: return False
-
-# --- 6. PDF ENGINE ---
+# --- 6. PDF ENGINE (WITH SIGNATURE) ---
 class PDF(FPDF):
     def header(self):
         if os.path.exists(LOGO_PATH): self.image(LOGO_PATH, 10, 8, 30)
@@ -184,20 +195,34 @@ def create_pdf(type, data):
         for label, value in fields:
             pdf.set_font("Helvetica", "B", 12); pdf.cell(50, 8, label, "B")
             pdf.set_font("Helvetica", "", 12); pdf.cell(140, 8, str(value), "B", 1)
+        
         pdf.ln(8); pdf.set_font("Helvetica", "B", 12); pdf.cell(0, 10, "Description / Reason:", 0, 1)
         pdf.set_font("Helvetica", "", 11); pdf.multi_cell(0, 6, data['reason']); pdf.ln(5)
         
+        # IMAGES (Smart Layout: 2 per page if fits)
         if data.get('local_img_paths'):
-            pdf.set_font("Helvetica", "B", 12); pdf.cell(0, 10, "Proof of Deduction:", 0, 1)
+            pdf.set_font("Helvetica", "B", 12); pdf.cell(0, 10, "Evidence:", 0, 1)
             for p in data['local_img_paths']:
                 if os.path.exists(p):
-                    if pdf.get_y() > 200: pdf.add_page()
-                    try: pdf.image(p, x=15, w=100); pdf.ln(5)
+                    if 280 - pdf.get_y() < 85: pdf.add_page() # Check space
+                    try: pdf.image(p, x=15, h=80); pdf.ln(5)
                     except: pass
+        
+        # SIGNATURE SECTION
+        if data.get('signature_path') and os.path.exists(data['signature_path']):
+            if 280 - pdf.get_y() < 40: pdf.add_page()
+            pdf.ln(5)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 5, "Authorized Signature:", 0, 1, 'R')
+            # Place signature image aligned right
+            pdf.image(data['signature_path'], x=140, w=50)
+            pdf.cell(0, 5, f"Engineer: {st.session_state.get('username')}", 0, 1, 'R')
+
         filename = f"DebitNote_{int(datetime.now().timestamp())}.pdf"
+    
     else: 
-        pdf.set_font("Helvetica", "", 12)
-        pdf.cell(0, 8, f"Contractor: {data['contractor']}", 0, 1)
+        # (Statement Logic remains same as previous version)
+        pdf.set_font("Helvetica", "", 12); pdf.cell(0, 8, f"Contractor: {data['contractor']}", 0, 1)
         pdf.cell(0, 8, f"Period: {data['start']} to {data['end']}", 0, 1); pdf.ln(5)
         pdf.set_font("Helvetica", "B", 10); pdf.set_fill_color(50, 50, 50); pdf.set_text_color(255)
         headers = ["Date", "Category", "Reason", "Amount"]
@@ -214,308 +239,191 @@ def create_pdf(type, data):
 
     path = f"temp/{filename}"; pdf.output(path); return path
 
-# --- 7. NOTIFICATIONS ---
-def notify_users(message, type="info"):
-    db_insert("Notifications", [int(datetime.now().timestamp()), message, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), type])
+# --- 7. UI & MAIN ---
+THEMES = { "Corporate Blue": {"bg": "#f4f6f9", "card": "rgba(255, 255, 255, 0.9)", "text": "#1e293b", "primary": "#0F52BA", "accent": "#3b82f6"} }
 
-def check_notifications():
-    try:
-        notifs = db_get("Notifications")
-        if notifs.empty: return []
-        notifs = notifs.sort_values(by="ID", ascending=False)
-        latest_id = int(notifs.iloc[0]['ID'])
-        if 'last_seen_notif' not in st.session_state: st.session_state['last_seen_notif'] = latest_id
-        elif latest_id > st.session_state['last_seen_notif']:
-            msg = notifs.iloc[0]['Message']
-            icon = "🚨" if notifs.iloc[0]['Type'] == "alert" else "📢"
-            st.toast(f"{icon} {msg}", icon=icon); st.session_state['last_seen_notif'] = latest_id
-        return notifs.head(5).to_dict('records')
-    except: return []
-
-# --- 8. UI HELPERS ---
-THEMES = {
-    "Corporate Blue": {"bg": "#f4f6f9", "card": "rgba(255, 255, 255, 0.9)", "text": "#1e293b", "primary": "#0F52BA", "accent": "#3b82f6"},
-    "Dark Mode": {"bg": "#0f172a", "card": "rgba(30, 41, 59, 0.8)", "text": "#f8fafc", "primary": "#3b82f6", "accent": "#60a5fa"},
-}
-def inject_css(theme_name):
-    t = THEMES.get(theme_name, THEMES["Corporate Blue"])
+def inject_css():
+    t = THEMES["Corporate Blue"]
     st.markdown(f"""<style>.stApp {{ background-color: {t['bg']}; color: {t['text']}; }}
         .glass-card {{background: {t['card']}; backdrop-filter: blur(10px); border-radius: 16px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px;}}
-        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}
-        h1, h2, h3 {{ color: {t['text']} !important; }}</style>""", unsafe_allow_html=True)
-def card_start(): st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-def card_end(): st.markdown('</div>', unsafe_allow_html=True)
+        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}</style>""", unsafe_allow_html=True)
 
-# --- 9. FORM RESET LOGIC (NEW) ---
-def reset_form_state():
-    # Clears specific session state keys to reset form
+def reset_form():
     st.session_state['dn_site'] = ""
     st.session_state['dn_amt'] = 0.0
     st.session_state['dn_reason'] = ""
     st.session_state['voice_text'] = ""
-    st.session_state['uploader_key'] += 1 # Increments uploader key to wipe files
+    st.session_state['uploader_key'] += 1
+    st.session_state['sig_key'] += 1
 
-# --- 10. MAIN APP ---
 def main():
-    st.set_page_config(page_title="GP Group Portal", page_icon="🏗️", layout="wide")
+    st.set_page_config(page_title="GP Portal", page_icon="🏗️", layout="wide")
     
-    # Init Session
-    if 'theme' not in st.session_state: st.session_state['theme'] = "Corporate Blue"
+    # Init State
     if 'uploader_key' not in st.session_state: st.session_state['uploader_key'] = 0
+    if 'sig_key' not in st.session_state: st.session_state['sig_key'] = 0
     if 'voice_text' not in st.session_state: st.session_state['voice_text'] = ""
-
-    # --- AUTO-LOGIN LOGIC (NEW) ---
+    
+    # Auto-Login
     if 'auth' not in st.session_state:
-        # Check URL Query Parameters
         params = st.query_params
         if "user" in params and "role" in params:
-            st.session_state['auth'] = True
-            st.session_state['username'] = params["user"]
-            st.session_state['role'] = params["role"]
-        else:
-            st.session_state['auth'] = False
+            st.session_state['auth'] = True; st.session_state['username'] = params["user"]; st.session_state['role'] = params["role"]
+        else: st.session_state['auth'] = False
 
-    inject_css(st.session_state['theme'])
+    inject_css(); 
     if 'db_init' not in st.session_state: init_db(); st.session_state['db_init'] = True
 
-    # --- LOGIN SCREEN ---
+    # Login
     if not st.session_state['auth']:
-        c1, c2, c3 = st.columns([1,1,1])
-        with c2:
-            card_start(); st.title("G P Portal Login")
-            u = st.text_input("Username"); p = st.text_input("Password", type="password")
-            if st.button("Login"):
-                users = db_get("Users")
-                match = users[(users['Username']==u) & (users['Password']==p)]
+        c1,c2,c3=st.columns([1,1,1])
+        with c2: 
+            st.title("Login"); u=st.text_input("User"); p=st.text_input("Pass", type="password")
+            if st.button("Log In"):
+                users=db_get("Users"); match=users[(users['Username']==u)&(users['Password']==p)]
                 if not match.empty:
-                    st.session_state['auth'] = True
-                    st.session_state['role'] = match.iloc[0]['Role']
-                    st.session_state['username'] = u
-                    # Save to URL for persistence
-                    st.query_params["user"] = u
-                    st.query_params["role"] = match.iloc[0]['Role']
-                    st.rerun()
-                else: st.error("Invalid Credentials")
-            card_end()
+                    st.session_state['auth']=True; st.session_state['username']=u; st.session_state['role']=match.iloc[0]['Role']
+                    st.query_params["user"]=u; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
+                else: st.error("Invalid")
         return
 
-    # --- TOP BAR ---
-    recent_notifs = check_notifications()
-    col_logo, col_space, col_user = st.columns([1, 4, 2])
-    with col_logo:
-        if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=120)
-    with col_user:
-        with st.expander(f"👤 {st.session_state['username']} ({st.session_state['role']})"):
-            if st.button("Logout"): 
-                st.session_state['auth'] = False
-                st.query_params.clear() # Clear URL
-                st.rerun()
-            st.session_state['theme'] = st.selectbox("Theme", list(THEMES.keys()))
-
-    # --- SIDEBAR (Standard Option Menu) ---
+    # Sidebar
     with st.sidebar:
-        st.title("Navigation")
-        opts = ["Dashboard", "Raise Debit Note"]
-        icons = ["grid-fill", "file-earmark-plus-fill"]
-        if st.session_state['role'] == "Admin": opts += ["Contractors", "User Management"]; icons += ["building-fill", "people-fill"]
-        sel = option_menu("Menu", opts, icons=icons, styles={"nav-link-selected": {"background-color": THEMES[st.session_state['theme']]['primary']}})
-        st.markdown("---"); st.subheader("🔔 Notification Center")
-        if recent_notifs:
-            for n in recent_notifs:
-                icon = "🚨" if n['Type'] == 'alert' else "📢"
-                st.caption(f"{icon} {n['Message']}"); st.text(f"{n['Timestamp']}"); st.divider()
-        else: st.caption("No recent alerts")
+        st.title("Menu"); opts=["Dashboard", "Raise Debit Note"]
+        if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
+        sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'building', 'people'])
+        if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
 
     # --- DASHBOARD ---
-   # --- DASHBOARD ---
     if sel == "Dashboard":
         st.title("Dashboard")
         df = db_get("DebitNotes")
-        cons = db_get("Contractors")
         
-        # 1. High Level Metrics
+        # Metrics
         if not df.empty:
             df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Deductions", f"₹{df['Amount'].sum():,.0f}")
-            m2.metric("Total Notes", len(df))
-            m3.metric("Last Update", df['Date'].max() if not df.empty else "-")
-
-            # 2. Charts
-            c1, c2 = st.columns(2)
-            with c1:
-                card_start()
-                st.subheader("Category Breakdown")
-                if 'Category' in df.columns:
-                    st.bar_chart(df.groupby('Category')['Amount'].sum(), color=THEMES[st.session_state['theme']]['primary'])
-                card_end()
-            with c2:
-                card_start()
-                st.subheader("Top Contractors")
-                st.bar_chart(df.groupby('Contractor Name')['Amount'].sum(), color=THEMES[st.session_state['theme']]['accent'])
-                card_end()
-
-        # 3. Search & Filter
-        card_start()
-        c1, c2 = st.columns([2, 1])
-        con_options = ["All"] + cons['Name'].tolist() if not cons.empty else ["All"]
-        search_con = c1.selectbox("Filter Contractor", con_options)
-        
-        if not df.empty:
-            if search_con != "All": df = df[df['Contractor Name'] == search_con]
-            df = df.sort_values(by="Date", ascending=False)
-        card_end()
-
-        # 4. Recent Activity
+            st.metric("Total Deductions", f"₹{df['Amount'].sum():,.0f}")
+            
+        # Recent
         st.subheader("Recent Activity")
         if not df.empty:
             for i, row in df.head(5).iterrows():
-                card_start()
-                rc1, rc2, rc3 = st.columns([2, 1, 1])
-                with rc1:
-                    st.markdown(f"**{row['Contractor Name']}**")
-                    st.caption(f"{row.get('Category', '-')} • {row['Date']}")
-                with rc2: st.markdown(f"**₹ {row['Amount']}**")
-                with rc3:
+                with st.expander(f"{row['Date']} | {row['Contractor Name']} | ₹{row['Amount']}"):
+                    st.write(f"**Reason:** {row['Reason']}")
                     if str(row['PDF Link']).startswith('http'): st.link_button("View PDF", row['PDF Link'])
-                card_end()
-        else: st.info("No records.")
-
-        # --- 5. MASTER PDF BUTTON (RESTORED) ---
-        st.markdown("---")
-        if st.button("📄 Generate Account Statement"):
-            st.session_state['show_gen'] = True
-            
+        
+        # Statement Button
+        if st.button("Generate Account Statement"): st.session_state['show_gen'] = True
         if st.session_state.get('show_gen'):
-            card_start()
-            st.subheader("Generate Statement")
-            if not df.empty:
-                # Filter Options
-                mc = st.selectbox("Select Contractor", df['Contractor Name'].unique())
-                mdr = st.date_input("Select Period", [])
-                
-                if st.button("Confirm & Download PDF"):
-                    if len(mdr) == 2:
-                        # Filter Data for Statement
-                        mask = (df['Contractor Name'] == mc) & (pd.to_datetime(df['Date']).dt.date >= mdr[0]) & (pd.to_datetime(df['Date']).dt.date <= mdr[1])
-                        f_df = df[mask]
-                        
-                        if not f_df.empty:
-                            # Generate Statement PDF
-                            path = create_pdf("statement", {"contractor": mc, "start": mdr[0], "end": mdr[1], "df": f_df})
-                            with open(path, "rb") as f:
-                                st.download_button("📥 Download Statement", f, file_name=os.path.basename(path))
-                        else:
-                            st.warning("No records found for this period.")
-                    else:
-                        st.warning("Please select a valid start and end date.")
-            if st.button("Close"): 
-                st.session_state['show_gen'] = False
-                st.rerun()
-            card_end()
+            mc = st.selectbox("Contractor", df['Contractor Name'].unique())
+            mdr = st.date_input("Period", [])
+            if st.button("Download"):
+                mask = (df['Contractor Name'] == mc) & (pd.to_datetime(df['Date']).dt.date >= mdr[0]) & (pd.to_datetime(df['Date']).dt.date <= mdr[1])
+                f_df = df[mask]
+                path = create_pdf("statement", {"contractor": mc, "start": mdr[0], "end": mdr[1], "df": f_df})
+                with open(path, "rb") as f: st.download_button("Download PDF", f, file_name="Statement.pdf")
 
-    # --- RAISE DEBIT NOTE ---
+    # --- RAISE DEBIT NOTE (UPDATED) ---
     elif sel == "Raise Debit Note":
         st.title("Raise Debit Note")
-        card_start()
         
-        if 'latest_pdf_path' not in st.session_state: st.session_state['latest_pdf_path'] = None
-
-        st.markdown("**🎙️ Voice Description:**")
-        audio = mic_recorder(start_prompt="Record", stop_prompt="Stop", key='recorder')
+        # 1. Voice Recorder (Outside Form to allow immediate update)
+        c_mic, c_label = st.columns([1, 4])
+        with c_mic:
+            # When clicked, this reruns the app and populates 'voice_text'
+            audio = mic_recorder(start_prompt="🎤 Record", stop_prompt="⏹️ Stop", key='recorder')
+        with c_label:
+            st.caption("Click Record -> Speak -> Click Stop. Text will appear below.")
+            
         if audio:
-            st.session_state['voice_text'] = transcribe_audio(audio['bytes'])
-            st.success(f"Transcribed: {st.session_state['voice_text']}")
+            text = transcribe_audio(audio['bytes'])
+            st.session_state['voice_text'] = text
+            st.toast("Audio Transcribed!")
 
-        with st.form("raise_form"):
+        # 2. The Form
+        with st.form("dn_form"):
             cons = db_get("Contractors")
             c_list = cons['Name'].tolist() if not cons.empty else []
+            
             c1, c2 = st.columns(2)
             con = c1.selectbox("Contractor", c_list)
             dt = c2.date_input("Date")
-            c3, c4 = st.columns(2)
-            cat = c3.selectbox("Reason Category", REASON_CATEGORIES)
             
-            # KEYED INPUTS FOR RESET
+            c3, c4 = st.columns(2)
+            cat = c3.selectbox("Category", REASON_CATEGORIES)
+            # KEY is crucial so data persists when voice recorder refreshes page
             amt = c4.number_input("Amount (INR)", min_value=0.0, key="dn_amt")
             site = st.text_input("Site Location", key="dn_site")
             
-            # Reason logic with voice
-            current_voice = st.session_state.get('voice_text', '')
-            reason = st.text_area("Reason", value=current_voice, key="dn_reason")
-
-            # Uploader with reset key
-            cam_img = st.camera_input("Take Photo")
-            files = st.file_uploader("Upload", accept_multiple_files=True, key=f"uploader_{st.session_state['uploader_key']}")
+            # Auto-populate from Voice State
+            reason = st.text_area("Description / Reason", value=st.session_state.get('voice_text', ''), key="dn_reason")
             
-            send_email = st.checkbox("Email PDF?", value=True)
-            submitted = st.form_submit_button("Submit & Notify")
+            # Camera / Upload
+            cam_img = st.camera_input("Take Photo")
+            files = st.file_uploader("Upload Photos", accept_multiple_files=True, key=f"uploader_{st.session_state['uploader_key']}")
+            
+            # 3. Signature Canvas
+            st.write("---")
+            st.write("**Engineer Signature:**")
+            sig_canvas = st_canvas(
+                stroke_width=2, stroke_color="#000000", background_color="#ffffff",
+                height=150, width=400, drawing_mode="freedraw", key=f"sig_{st.session_state['sig_key']}"
+            )
+            
+            submitted = st.form_submit_button("Submit & Email Contractor")
             
             if submitted:
+                # Process Images
                 imgs, links = [], []
-                # Process Camera
                 if cam_img:
-                    cp = compress_image(cam_img); imgs.append(cp)
-                    links.append(upload_to_drive(cp, "cam.jpg", "image/jpeg"))
-                # Process Uploads
+                    cp = compress_image(cam_img); imgs.append(cp); links.append(upload_to_drive(cp, "cam.jpg", "image/jpeg"))
                 if files:
-                    for f in files:
-                        cp = compress_image(f); imgs.append(cp)
-                        links.append(upload_to_drive(cp, f.name, "image/jpeg"))
+                    for f in files: cp = compress_image(f); imgs.append(cp); links.append(upload_to_drive(cp, f.name, "image/jpeg"))
                 
-                data = {"contractor": con, "date": str(dt), "amount": amt, "category": cat, "reason": reason, "site": site, "local_img_paths": imgs}
+                # Process Signature
+                sig_path = process_signature(sig_canvas.image_data)
+                
+                # Generate PDF
+                data = {"contractor": con, "date": str(dt), "amount": amt, "category": cat, "reason": reason, 
+                        "site": site, "local_img_paths": imgs, "signature_path": sig_path}
                 pdf_path = create_pdf("receipt", data)
                 pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
                 
+                # Save DB
                 db_insert("DebitNotes", [int(datetime.now().timestamp()), con, str(dt), amt, cat, reason, site, ",".join(links), pdf_link, st.session_state['username']])
-                notify_users(f"New Note: {con} charged ₹{amt}", type="alert")
                 
-                if send_email:
-                    con_row = cons[cons['Name'] == con]
-                    if not con_row.empty and 'Email' in con_row.columns and str(con_row.iloc[0]['Email']) != "":
-                        send_email_with_pdf([con_row.iloc[0]['Email']], f"Debit Note - {con}", f"Debit note raised for {cat}.\nAmount: {amt}", pdf_path)
-                        st.toast("Email sent!")
+                # EMAIL CONTRACTOR LOGIC
+                con_row = cons[cons['Name'] == con]
+                if not con_row.empty and 'Email' in con_row.columns and str(con_row.iloc[0]['Email']) != "":
+                    email_to = con_row.iloc[0]['Email']
+                    body = f"Dear {con},\n\nA Debit Note (INR {amt}) has been raised for {cat}.\nPlease find the attached PDF.\n\nSite: {site}\nEngineer: {st.session_state['username']}"
+                    sent = send_email_with_pdf([email_to], f"Debit Note Notification - {con}", body, pdf_path)
+                    if sent: st.success(f"✅ Email sent to {email_to}")
+                    else: st.warning("❌ Could not send email. Check Email Settings.")
+                else:
+                    st.warning(f"⚠️ No email found for {con}. PDF generated but not emailed.")
 
-                st.session_state['latest_pdf_path'] = pdf_path
-                st.success("Raised Successfully!")
-                
-                # RESET FORM LOGIC
-                reset_form_state()
+                # Reset
+                reset_form()
                 time.sleep(1)
                 st.rerun()
 
-        if st.session_state['latest_pdf_path']:
-            st.markdown("---")
-            with open(st.session_state['latest_pdf_path'], "rb") as f:
-                st.download_button("📥 Download PDF", f, file_name="DebitNote.pdf")
-        card_end()
-
-    # --- ADMIN PAGES ---
+    # --- ADMIN ---
     elif sel == "Contractors" and st.session_state['role'] == "Admin":
         st.title("Contractors"); c1, c2 = st.columns([1, 2])
         with c1:
-            card_start()
-            with st.form("add_con"):
+            with st.form("add_c"):
                 n = st.text_input("Name"); e = st.text_input("Email"); d = st.text_input("Details")
                 if st.form_submit_button("Add"): db_insert("Contractors", [int(datetime.now().timestamp()), n, d, e]); st.rerun()
-            card_end()
-        with c2: card_start(); st.dataframe(db_get("Contractors"), use_container_width=True); card_end()
+        with c2: st.dataframe(db_get("Contractors"), use_container_width=True)
 
     elif sel == "User Management" and st.session_state['role'] == "Admin":
         st.title("Users"); c1, c2 = st.columns(2)
         with c1:
-            card_start()
             with st.form("add_u"):
                 u = st.text_input("User"); p = st.text_input("Pass", type="password"); r = st.selectbox("Role", ["Engineer", "Admin"])
-                if st.form_submit_button("Create"): db_insert("Users", [u, p, r]); st.rerun()
-            card_end()
-        with c2:
-            card_start()
-            users = db_get("Users")
-            if not users.empty:
-                t = st.selectbox("Select User", users['Username'])
-                if st.button("Delete"): db_delete("Users", "Username", t); st.rerun()
-        card_start(); st.dataframe(users, use_container_width=True); card_end()
+                if st.form_submit_button("Add"): db_insert("Users", [u, p, r]); st.rerun()
+        with c2: st.dataframe(db_get("Users"), use_container_width=True)
 
 if __name__ == "__main__":
     main()
