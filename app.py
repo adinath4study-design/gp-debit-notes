@@ -301,7 +301,7 @@ def main():
     with st.sidebar:
         st.title("Menu"); opts=["Dashboard", "Raise Debit Note"]
         if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
-        sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'building', 'people'])
+        sel=option_menu("Navigation", opts, icons=['grid', 'file-text', 'building', 'people'])
         st.markdown("---")
         if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
         
