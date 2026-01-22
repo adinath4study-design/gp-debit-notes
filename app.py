@@ -46,11 +46,13 @@ def upload_to_drive(file_path, filename, mime_type):
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype=mime_type)
     
+    # Upload
     file = service.files().create(
         body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
     ).execute()
     file_id = file.get('id')
     
+    # Force Public Permission
     try:
         service.permissions().create(
             fileId=file_id,
@@ -77,18 +79,11 @@ def compress_image(image_file):
     return filepath
 
 def process_signature(canvas_data):
-    """Converts signature canvas array to an image file"""
     if canvas_data is None: return None
     if not os.path.exists("temp"): os.makedirs("temp")
-    
-    # Convert numpy array to image
     img = Image.fromarray(canvas_data.astype('uint8'), 'RGBA')
-    
-    # Check if blank (all pixels are transparent or white)
-    # Simple check: if alpha channel is all 0, it's empty
-    alpha = img.split()[-1]
-    if alpha.getextrema()[1] == 0: return None
-
+    # Check if empty (fully transparent)
+    if img.getextrema()[3][1] == 0: return None
     path = f"temp/sig_{int(datetime.now().timestamp())}.png"
     img.save(path, "PNG")
     return path
@@ -105,13 +100,11 @@ def send_email_with_pdf(to_emails, subject, body, attachment_path):
     if not to_emails or "email_settings" not in st.secrets: return False
     sender_email = st.secrets["email_settings"]["sender_email"]
     password = st.secrets["email_settings"]["app_password"]
-    
     msg = MIMEMultipart()
     msg['From'] = sender_email
     msg['To'] = ", ".join(to_emails)
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
-    
     if attachment_path and os.path.exists(attachment_path):
         with open(attachment_path, "rb") as attachment:
             part = MIMEBase("application", "octet-stream")
@@ -119,14 +112,12 @@ def send_email_with_pdf(to_emails, subject, body, attachment_path):
         encoders.encode_base64(part)
         part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(attachment_path)}")
         msg.attach(part)
-        
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls(); server.login(sender_email, password)
         server.sendmail(sender_email, to_emails, msg.as_string())
         server.quit(); return True
-    except Exception as e: 
-        print(e); return False
+    except: return False
 
 # --- 5. DATABASE OPERATIONS ---
 def init_db():
@@ -170,7 +161,7 @@ def db_delete(table, col_name, value):
         cell = ws.find(str(value)); ws.delete_rows(cell.row); return True
     except: return False
 
-# --- 6. PDF ENGINE (WITH SIGNATURE) ---
+# --- 6. PDF ENGINE ---
 class PDF(FPDF):
     def header(self):
         if os.path.exists(LOGO_PATH): self.image(LOGO_PATH, 10, 8, 30)
@@ -199,29 +190,27 @@ def create_pdf(type, data):
         pdf.ln(8); pdf.set_font("Helvetica", "B", 12); pdf.cell(0, 10, "Description / Reason:", 0, 1)
         pdf.set_font("Helvetica", "", 11); pdf.multi_cell(0, 6, data['reason']); pdf.ln(5)
         
-        # IMAGES (Smart Layout: 2 per page if fits)
+        # SMART IMAGE LAYOUT
         if data.get('local_img_paths'):
             pdf.set_font("Helvetica", "B", 12); pdf.cell(0, 10, "Evidence:", 0, 1)
             for p in data['local_img_paths']:
                 if os.path.exists(p):
-                    if 280 - pdf.get_y() < 85: pdf.add_page() # Check space
+                    # Check space (Page height ~297mm)
+                    if 280 - pdf.get_y() < 85: pdf.add_page()
                     try: pdf.image(p, x=15, h=80); pdf.ln(5)
                     except: pass
         
-        # SIGNATURE SECTION
+        # SIGNATURE
         if data.get('signature_path') and os.path.exists(data['signature_path']):
             if 280 - pdf.get_y() < 40: pdf.add_page()
-            pdf.ln(5)
-            pdf.set_font("Helvetica", "B", 10)
+            pdf.ln(5); pdf.set_font("Helvetica", "B", 10)
             pdf.cell(0, 5, "Authorized Signature:", 0, 1, 'R')
-            # Place signature image aligned right
             pdf.image(data['signature_path'], x=140, w=50)
             pdf.cell(0, 5, f"Engineer: {st.session_state.get('username')}", 0, 1, 'R')
 
         filename = f"DebitNote_{int(datetime.now().timestamp())}.pdf"
     
-    else: 
-        # (Statement Logic remains same as previous version)
+    else: # Statement
         pdf.set_font("Helvetica", "", 12); pdf.cell(0, 8, f"Contractor: {data['contractor']}", 0, 1)
         pdf.cell(0, 8, f"Period: {data['start']} to {data['end']}", 0, 1); pdf.ln(5)
         pdf.set_font("Helvetica", "B", 10); pdf.set_fill_color(50, 50, 50); pdf.set_text_color(255)
@@ -239,191 +228,27 @@ def create_pdf(type, data):
 
     path = f"temp/{filename}"; pdf.output(path); return path
 
-# --- 7. UI & MAIN ---
-THEMES = { "Corporate Blue": {"bg": "#f4f6f9", "card": "rgba(255, 255, 255, 0.9)", "text": "#1e293b", "primary": "#0F52BA", "accent": "#3b82f6"} }
+# --- 7. NOTIFICATIONS ---
+def notify_users(message, type="info"):
+    db_insert("Notifications", [int(datetime.now().timestamp()), message, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), type])
 
+def check_notifications():
+    try:
+        notifs = db_get("Notifications")
+        if notifs.empty: return []
+        notifs = notifs.sort_values(by="ID", ascending=False)
+        latest_id = int(notifs.iloc[0]['ID'])
+        if 'last_seen_notif' not in st.session_state: st.session_state['last_seen_notif'] = latest_id
+        elif latest_id > st.session_state['last_seen_notif']:
+            msg = notifs.iloc[0]['Message']; icon = "🚨" if notifs.iloc[0]['Type'] == "alert" else "📢"
+            st.toast(f"{icon} {msg}", icon=icon); st.session_state['last_seen_notif'] = latest_id
+        return notifs.head(5).to_dict('records')
+    except: return []
+
+# --- 8. UI HELPERS ---
+THEMES = { "Corporate Blue": {"bg": "#f4f6f9", "card": "rgba(255, 255, 255, 0.9)", "text": "#1e293b", "primary": "#0F52BA", "accent": "#3b82f6"} }
 def inject_css():
     t = THEMES["Corporate Blue"]
     st.markdown(f"""<style>.stApp {{ background-color: {t['bg']}; color: {t['text']}; }}
         .glass-card {{background: {t['card']}; backdrop-filter: blur(10px); border-radius: 16px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px;}}
-        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}</style>""", unsafe_allow_html=True)
-
-def reset_form():
-    st.session_state['dn_site'] = ""
-    st.session_state['dn_amt'] = 0.0
-    st.session_state['dn_reason'] = ""
-    st.session_state['voice_text'] = ""
-    st.session_state['uploader_key'] += 1
-    st.session_state['sig_key'] += 1
-
-def main():
-    st.set_page_config(page_title="GP Portal", page_icon="🏗️", layout="wide")
-    
-    # Init State
-    if 'uploader_key' not in st.session_state: st.session_state['uploader_key'] = 0
-    if 'sig_key' not in st.session_state: st.session_state['sig_key'] = 0
-    if 'voice_text' not in st.session_state: st.session_state['voice_text'] = ""
-    
-    # Auto-Login
-    if 'auth' not in st.session_state:
-        params = st.query_params
-        if "user" in params and "role" in params:
-            st.session_state['auth'] = True; st.session_state['username'] = params["user"]; st.session_state['role'] = params["role"]
-        else: st.session_state['auth'] = False
-
-    inject_css(); 
-    if 'db_init' not in st.session_state: init_db(); st.session_state['db_init'] = True
-
-    # Login
-    if not st.session_state['auth']:
-        c1,c2,c3=st.columns([1,1,1])
-        with c2: 
-            st.title("Login"); u=st.text_input("User"); p=st.text_input("Pass", type="password")
-            if st.button("Log In"):
-                users=db_get("Users"); match=users[(users['Username']==u)&(users['Password']==p)]
-                if not match.empty:
-                    st.session_state['auth']=True; st.session_state['username']=u; st.session_state['role']=match.iloc[0]['Role']
-                    st.query_params["user"]=u; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
-                else: st.error("Invalid")
-        return
-
-    # Sidebar
-    with st.sidebar:
-        st.title("Menu"); opts=["Dashboard", "Raise Debit Note"]
-        if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
-        sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'building', 'people'])
-        if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
-
-    # --- DASHBOARD ---
-    if sel == "Dashboard":
-        st.title("Dashboard")
-        df = db_get("DebitNotes")
-        
-        # Metrics
-        if not df.empty:
-            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
-            st.metric("Total Deductions", f"₹{df['Amount'].sum():,.0f}")
-            
-        # Recent
-        st.subheader("Recent Activity")
-        if not df.empty:
-            for i, row in df.head(5).iterrows():
-                with st.expander(f"{row['Date']} | {row['Contractor Name']} | ₹{row['Amount']}"):
-                    st.write(f"**Reason:** {row['Reason']}")
-                    if str(row['PDF Link']).startswith('http'): st.link_button("View PDF", row['PDF Link'])
-        
-        # Statement Button
-        if st.button("Generate Account Statement"): st.session_state['show_gen'] = True
-        if st.session_state.get('show_gen'):
-            mc = st.selectbox("Contractor", df['Contractor Name'].unique())
-            mdr = st.date_input("Period", [])
-            if st.button("Download"):
-                mask = (df['Contractor Name'] == mc) & (pd.to_datetime(df['Date']).dt.date >= mdr[0]) & (pd.to_datetime(df['Date']).dt.date <= mdr[1])
-                f_df = df[mask]
-                path = create_pdf("statement", {"contractor": mc, "start": mdr[0], "end": mdr[1], "df": f_df})
-                with open(path, "rb") as f: st.download_button("Download PDF", f, file_name="Statement.pdf")
-
-    # --- RAISE DEBIT NOTE (UPDATED) ---
-    elif sel == "Raise Debit Note":
-        st.title("Raise Debit Note")
-        
-        # 1. Voice Recorder (Outside Form to allow immediate update)
-        c_mic, c_label = st.columns([1, 4])
-        with c_mic:
-            # When clicked, this reruns the app and populates 'voice_text'
-            audio = mic_recorder(start_prompt="🎤 Record", stop_prompt="⏹️ Stop", key='recorder')
-        with c_label:
-            st.caption("Click Record -> Speak -> Click Stop. Text will appear below.")
-            
-        if audio:
-            text = transcribe_audio(audio['bytes'])
-            st.session_state['voice_text'] = text
-            st.toast("Audio Transcribed!")
-
-        # 2. The Form
-        with st.form("dn_form"):
-            cons = db_get("Contractors")
-            c_list = cons['Name'].tolist() if not cons.empty else []
-            
-            c1, c2 = st.columns(2)
-            con = c1.selectbox("Contractor", c_list)
-            dt = c2.date_input("Date")
-            
-            c3, c4 = st.columns(2)
-            cat = c3.selectbox("Category", REASON_CATEGORIES)
-            # KEY is crucial so data persists when voice recorder refreshes page
-            amt = c4.number_input("Amount (INR)", min_value=0.0, key="dn_amt")
-            site = st.text_input("Site Location", key="dn_site")
-            
-            # Auto-populate from Voice State
-            reason = st.text_area("Description / Reason", value=st.session_state.get('voice_text', ''), key="dn_reason")
-            
-            # Camera / Upload
-            cam_img = st.camera_input("Take Photo")
-            files = st.file_uploader("Upload Photos", accept_multiple_files=True, key=f"uploader_{st.session_state['uploader_key']}")
-            
-            # 3. Signature Canvas
-            st.write("---")
-            st.write("**Engineer Signature:**")
-            sig_canvas = st_canvas(
-                stroke_width=2, stroke_color="#000000", background_color="#ffffff",
-                height=150, width=400, drawing_mode="freedraw", key=f"sig_{st.session_state['sig_key']}"
-            )
-            
-            submitted = st.form_submit_button("Submit & Email Contractor")
-            
-            if submitted:
-                # Process Images
-                imgs, links = [], []
-                if cam_img:
-                    cp = compress_image(cam_img); imgs.append(cp); links.append(upload_to_drive(cp, "cam.jpg", "image/jpeg"))
-                if files:
-                    for f in files: cp = compress_image(f); imgs.append(cp); links.append(upload_to_drive(cp, f.name, "image/jpeg"))
-                
-                # Process Signature
-                sig_path = process_signature(sig_canvas.image_data)
-                
-                # Generate PDF
-                data = {"contractor": con, "date": str(dt), "amount": amt, "category": cat, "reason": reason, 
-                        "site": site, "local_img_paths": imgs, "signature_path": sig_path}
-                pdf_path = create_pdf("receipt", data)
-                pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
-                
-                # Save DB
-                db_insert("DebitNotes", [int(datetime.now().timestamp()), con, str(dt), amt, cat, reason, site, ",".join(links), pdf_link, st.session_state['username']])
-                
-                # EMAIL CONTRACTOR LOGIC
-                con_row = cons[cons['Name'] == con]
-                if not con_row.empty and 'Email' in con_row.columns and str(con_row.iloc[0]['Email']) != "":
-                    email_to = con_row.iloc[0]['Email']
-                    body = f"Dear {con},\n\nA Debit Note (INR {amt}) has been raised for {cat}.\nPlease find the attached PDF.\n\nSite: {site}\nEngineer: {st.session_state['username']}"
-                    sent = send_email_with_pdf([email_to], f"Debit Note Notification - {con}", body, pdf_path)
-                    if sent: st.success(f"✅ Email sent to {email_to}")
-                    else: st.warning("❌ Could not send email. Check Email Settings.")
-                else:
-                    st.warning(f"⚠️ No email found for {con}. PDF generated but not emailed.")
-
-                # Reset
-                reset_form()
-                time.sleep(1)
-                st.rerun()
-
-    # --- ADMIN ---
-    elif sel == "Contractors" and st.session_state['role'] == "Admin":
-        st.title("Contractors"); c1, c2 = st.columns([1, 2])
-        with c1:
-            with st.form("add_c"):
-                n = st.text_input("Name"); e = st.text_input("Email"); d = st.text_input("Details")
-                if st.form_submit_button("Add"): db_insert("Contractors", [int(datetime.now().timestamp()), n, d, e]); st.rerun()
-        with c2: st.dataframe(db_get("Contractors"), use_container_width=True)
-
-    elif sel == "User Management" and st.session_state['role'] == "Admin":
-        st.title("Users"); c1, c2 = st.columns(2)
-        with c1:
-            with st.form("add_u"):
-                u = st.text_input("User"); p = st.text_input("Pass", type="password"); r = st.selectbox("Role", ["Engineer", "Admin"])
-                if st.form_submit_button("Add"): db_insert("Users", [u, p, r]); st.rerun()
-        with c2: st.dataframe(db_get("Users"), use_container_width=True)
-
-if __name__ == "__main__":
-    main()
+        .stButton>button {{background: linear-gradient(
