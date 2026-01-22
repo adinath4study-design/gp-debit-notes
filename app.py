@@ -251,4 +251,201 @@ def inject_css():
     t = THEMES["Corporate Blue"]
     st.markdown(f"""<style>.stApp {{ background-color: {t['bg']}; color: {t['text']}; }}
         .glass-card {{background: {t['card']}; backdrop-filter: blur(10px); border-radius: 16px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px;}}
-        .stButton>button {{background: linear-gradient(
+        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}</style>""", unsafe_allow_html=True)
+def card_start(): st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+def card_end(): st.markdown('</div>', unsafe_allow_html=True)
+
+# --- 9. RESET FUNCTION ---
+def reset_form():
+    st.session_state['dn_site'] = ""
+    st.session_state['dn_amt'] = 0.0
+    st.session_state['dn_reason'] = ""
+    st.session_state['voice_text'] = ""
+    st.session_state['uploader_key'] += 1
+    st.session_state['sig_key'] += 1
+
+# --- 10. MAIN APP ---
+def main():
+    st.set_page_config(page_title="GP Portal", page_icon="🏗️", layout="wide")
+    
+    # Init State
+    if 'uploader_key' not in st.session_state: st.session_state['uploader_key'] = 0
+    if 'sig_key' not in st.session_state: st.session_state['sig_key'] = 0
+    if 'voice_text' not in st.session_state: st.session_state['voice_text'] = ""
+    
+    # Auto-Login Check
+    if 'auth' not in st.session_state:
+        params = st.query_params
+        if "user" in params and "role" in params:
+            st.session_state['auth'] = True; st.session_state['username'] = params["user"]; st.session_state['role'] = params["role"]
+        else: st.session_state['auth'] = False
+
+    inject_css(); 
+    if 'db_init' not in st.session_state: init_db(); st.session_state['db_init'] = True
+
+    # Login Screen
+    if not st.session_state['auth']:
+        c1,c2,c3=st.columns([1,1,1])
+        with c2: 
+            card_start(); st.title("Login"); u=st.text_input("User"); p=st.text_input("Pass", type="password")
+            if st.button("Log In"):
+                users=db_get("Users"); match=users[(users['Username']==u)&(users['Password']==p)]
+                if not match.empty:
+                    st.session_state['auth']=True; st.session_state['username']=u; st.session_state['role']=match.iloc[0]['Role']
+                    st.query_params["user"]=u; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
+                else: st.error("Invalid")
+            card_end()
+        return
+
+    # Sidebar
+    with st.sidebar:
+        st.title("Menu"); opts=["Dashboard", "Raise Debit Note"]
+        if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
+        sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'building', 'people'])
+        st.markdown("---")
+        if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
+        
+        # Notification Center
+        st.subheader("🔔 Alerts")
+        recent_notifs = check_notifications()
+        if recent_notifs:
+            for n in recent_notifs:
+                icon = "🚨" if n['Type'] == 'alert' else "📢"
+                st.caption(f"{icon} {n['Message']}"); st.divider()
+
+    # --- DASHBOARD ---
+    if sel == "Dashboard":
+        st.title("Dashboard")
+        df = db_get("DebitNotes"); cons = db_get("Contractors")
+        
+        if not df.empty:
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total", f"₹{df['Amount'].sum():,.0f}"); m2.metric("Count", len(df)); m3.metric("Last", df['Date'].max())
+            
+            c1, c2 = st.columns(2)
+            with c1: card_start(); st.subheader("Category Breakdown"); st.bar_chart(df.groupby('Category')['Amount'].sum() if 'Category' in df.columns else []); card_end()
+            with c2: card_start(); st.subheader("Top Contractors"); st.bar_chart(df.groupby('Contractor Name')['Amount'].sum()); card_end()
+
+        # Search
+        card_start()
+        c1, c2 = st.columns([2, 1])
+        con_options = ["All"] + cons['Name'].tolist() if not cons.empty else ["All"]
+        search_con = c1.selectbox("Filter", con_options)
+        if not df.empty and search_con != "All": df = df[df['Contractor Name'] == search_con]
+        card_end()
+        
+        # Activity
+        st.subheader("Recent Activity")
+        if not df.empty:
+            for i, row in df.sort_values(by="Date", ascending=False).head(5).iterrows():
+                card_start()
+                rc1, rc2 = st.columns([3, 1])
+                with rc1: st.write(f"**{row['Contractor Name']}** | ₹{row['Amount']}"); st.caption(f"{row['Reason']}")
+                with rc2: 
+                    if str(row['PDF Link']).startswith('http'): st.link_button("View PDF", row['PDF Link'])
+                card_end()
+        
+        # Statement
+        st.markdown("---")
+        if st.button("Generate Account Statement"): st.session_state['show_gen'] = True
+        if st.session_state.get('show_gen'):
+            card_start(); st.subheader("Download Statement")
+            mc = st.selectbox("Contractor", df['Contractor Name'].unique())
+            mdr = st.date_input("Period", [])
+            if st.button("Download PDF"):
+                mask = (df['Contractor Name'] == mc) & (pd.to_datetime(df['Date']).dt.date >= mdr[0]) & (pd.to_datetime(df['Date']).dt.date <= mdr[1])
+                f_df = df[mask]
+                if not f_df.empty:
+                    path = create_pdf("statement", {"contractor": mc, "start": mdr[0], "end": mdr[1], "df": f_df})
+                    with open(path, "rb") as f: st.download_button("Download File", f, file_name="Statement.pdf")
+                else: st.warning("No data found.")
+            card_end()
+
+    # --- RAISE DEBIT NOTE (ALL NEW FEATURES) ---
+    elif sel == "Raise Debit Note":
+        st.title("Raise Debit Note")
+        card_start()
+        
+        # 1. Voice Recorder (Inside/Above Description)
+        st.write("🎙️ **Voice Description** (Click Record -> Speak -> Stop)")
+        audio = mic_recorder(start_prompt="Record", stop_prompt="Stop", key='recorder')
+        if audio:
+            st.session_state['voice_text'] = transcribe_audio(audio['bytes'])
+            st.success("Audio captured! Text added below.")
+
+        with st.form("dn_form"):
+            cons = db_get("Contractors"); c_list = cons['Name'].tolist() if not cons.empty else []
+            c1, c2 = st.columns(2)
+            con = c1.selectbox("Contractor", c_list)
+            dt = c2.date_input("Date")
+            
+            c3, c4 = st.columns(2)
+            cat = c3.selectbox("Category", REASON_CATEGORIES)
+            amt = c4.number_input("Amount (INR)", min_value=0.0, key="dn_amt")
+            site = st.text_input("Site Location", key="dn_site")
+            
+            # Auto-fill from voice
+            reason = st.text_area("Description / Reason", value=st.session_state.get('voice_text', ''), key="dn_reason")
+            
+            # Camera / Upload
+            cam_img = st.camera_input("Take Photo")
+            files = st.file_uploader("Upload Photos", accept_multiple_files=True, key=f"uploader_{st.session_state['uploader_key']}")
+            
+            # Signature
+            st.write("---"); st.write("**Engineer Signature:**")
+            sig_canvas = st_canvas(stroke_width=2, stroke_color="black", background_color="white", height=150, width=400, drawing_mode="freedraw", key=f"sig_{st.session_state['sig_key']}")
+            
+            submitted = st.form_submit_button("Submit & Email Contractor")
+            
+            if submitted:
+                # Process Images
+                imgs, links = [], []
+                if cam_img:
+                    cp = compress_image(cam_img); imgs.append(cp); links.append(upload_to_drive(cp, "cam.jpg", "image/jpeg"))
+                if files:
+                    for f in files: cp = compress_image(f); imgs.append(cp); links.append(upload_to_drive(cp, f.name, "image/jpeg"))
+                
+                # Process Signature
+                sig_path = process_signature(sig_canvas.image_data)
+                
+                # PDF & DB
+                data = {"contractor": con, "date": str(dt), "amount": amt, "category": cat, "reason": reason, "site": site, "local_img_paths": imgs, "signature_path": sig_path}
+                pdf_path = create_pdf("receipt", data)
+                pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
+                
+                db_insert("DebitNotes", [int(datetime.now().timestamp()), con, str(dt), amt, cat, reason, site, ",".join(links), pdf_link, st.session_state['username']])
+                
+                # Notify & Email
+                notify_users(f"New Note: {con} charged ₹{amt}", type="alert")
+                con_row = cons[cons['Name'] == con]
+                if not con_row.empty and 'Email' in con_row.columns and str(con_row.iloc[0]['Email']) != "":
+                    email_to = con_row.iloc[0]['Email']
+                    body = f"Dear {con},\n\nA Debit Note (INR {amt}) has been raised.\nSite: {site}\nEngineer: {st.session_state['username']}\n\nPDF Attached."
+                    send_email_with_pdf([email_to], f"Debit Note - {con}", body, pdf_path)
+                    st.toast(f"Email sent to {email_to}")
+                else: st.warning("No email found for contractor. PDF saved.")
+
+                # Reset
+                reset_form(); time.sleep(1); st.rerun()
+        card_end()
+
+    # --- ADMIN PAGES ---
+    elif sel == "Contractors" and st.session_state['role'] == "Admin":
+        st.title("Contractors"); c1, c2 = st.columns([1, 2])
+        with c1:
+            with st.form("add_c"):
+                n = st.text_input("Name"); e = st.text_input("Email"); d = st.text_input("Details")
+                if st.form_submit_button("Add"): db_insert("Contractors", [int(datetime.now().timestamp()), n, d, e]); st.rerun()
+        with c2: st.dataframe(db_get("Contractors"), use_container_width=True)
+
+    elif sel == "User Management" and st.session_state['role'] == "Admin":
+        st.title("Users"); c1, c2 = st.columns(2)
+        with c1:
+            with st.form("add_u"):
+                u = st.text_input("User"); p = st.text_input("Pass", type="password"); r = st.selectbox("Role", ["Engineer", "Admin"])
+                if st.form_submit_button("Add"): db_insert("Users", [u, p, r]); st.rerun()
+        with c2: st.dataframe(db_get("Users"), use_container_width=True)
+
+if __name__ == "__main__":
+    main()
