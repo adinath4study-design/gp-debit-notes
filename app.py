@@ -312,7 +312,7 @@ def main():
         
         opts=["Dashboard", "Raise Debit Note", "My Profile"] # Added Profile
         if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
-        sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'person-circle', 'building', 'people'])
+        sel=option_menu("Navigation", opts, icons=['grid', 'file-text', 'person-circle', 'building', 'people'])
         if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
 
     # --- DASHBOARD (With Delete & Bulk Download) ---
@@ -467,4 +467,5 @@ def main():
         with c2: st.dataframe(db_get("Users"), use_container_width=True)
 
 if __name__ == "__main__":
+
     main()
