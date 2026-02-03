@@ -18,7 +18,7 @@ import speech_recognition as sr
 from streamlit_mic_recorder import mic_recorder
 import io
 from PIL import Image
-from pypdf import PdfWriter # NEW: For merging PDFs
+from pypdf import PdfWriter
 import re
 
 # --- 1. CONFIGURATION ---
@@ -60,33 +60,26 @@ def upload_to_drive(file_path, filename, mime_type):
 
 # --- 3. HELPER FUNCTIONS ---
 def get_file_id_from_url(url):
-    """Extracts Google Drive File ID from URL"""
     match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else None
 
 def download_pdf_from_drive(drive_link):
-    """Downloads a PDF into memory from Google Drive Link"""
     file_id = get_file_id_from_url(drive_link)
     if not file_id: return None
-    
     service = get_drive_service()
     request = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
-    while done is False:
-        status, done = downloader.next_chunk()
+    while done is False: status, done = downloader.next_chunk()
     return fh
 
 def merge_pdfs(pdf_links):
-    """Downloads multiple PDFs and merges them into one"""
     merger = PdfWriter()
     for link in pdf_links:
         if str(link).startswith('http'):
             pdf_bytes = download_pdf_from_drive(link)
-            if pdf_bytes:
-                merger.append(pdf_bytes)
-    
+            if pdf_bytes: merger.append(pdf_bytes)
     output = io.BytesIO()
     merger.write(output)
     return output.getvalue()
@@ -141,7 +134,7 @@ def init_db():
         tables = {
             "DebitNotes": ["ID", "Contractor Name", "Date", "Amount", "Category", "Reason", "Site Location", "Image Links", "PDF Link", "SubmittedBy"],
             "Contractors": ["ID", "Name", "Details", "Email"],
-            "Users": ["Username", "Password", "Role", "ProfilePic"], # Added ProfilePic
+            "Users": ["Username", "Password", "Role", "ProfilePic"],
             "Notifications": ["ID", "Message", "Timestamp", "Type"]
         }
         for name, headers in tables.items():
@@ -172,12 +165,8 @@ def db_update_user(old_username, new_username, new_password, new_pic_link):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Users")
     try:
         cell = ws.find(old_username)
-        # Update Password (Col 2)
         if new_password: ws.update_cell(cell.row, 2, new_password)
-        # Update Role is skipped (User shouldn't change own role)
-        # Update Profile Pic (Col 4)
         if new_pic_link: ws.update_cell(cell.row, 4, new_pic_link)
-        # Update Username (Col 1) - Last to avoid losing ref
         if new_username and new_username != old_username: ws.update_cell(cell.row, 1, new_username)
         return True
     except: return False
@@ -219,11 +208,9 @@ def create_pdf(type, data):
             for i in range(0, len(img_paths), 2):
                 if 270 - pdf.get_y() < 85: pdf.add_page()
                 y_pos = pdf.get_y()
-                # Left
                 with Image.open(img_paths[i]) as img: aspect = img.height/img.width
                 if aspect > (box_h/box_w): pdf.image(img_paths[i], x=10, y=y_pos, h=box_h)
                 else: pdf.image(img_paths[i], x=10, y=y_pos, w=box_w)
-                # Right
                 if i+1 < len(img_paths):
                     with Image.open(img_paths[i+1]) as img: aspect = img.height/img.width
                     if aspect > (box_h/box_w): pdf.image(img_paths[i+1], x=105, y=y_pos, h=box_h)
@@ -238,7 +225,6 @@ def create_pdf(type, data):
             pdf.set_y(sig_y+30); pdf.set_x(130); pdf.cell(60, 5, f"Engineer: {st.session_state.get('username')}", 0, 1, 'C')
         filename = f"DebitNote_{int(datetime.now().timestamp())}.pdf"
     else:
-        # Statement
         pdf.set_font("Helvetica", "", 12); pdf.cell(0, 8, f"Contractor: {data['contractor']}", 0, 1)
         pdf.cell(0, 8, f"Period: {data['start']} to {data['end']}", 0, 1); pdf.ln(5)
         pdf.set_font("Helvetica", "B", 10); pdf.set_fill_color(50, 50, 50); pdf.set_text_color(255)
@@ -294,7 +280,6 @@ def main():
                 users=db_get("Users"); match=users[(users['Username']==u)&(users['Password']==p)]
                 if not match.empty:
                     st.session_state['auth']=True; st.session_state['username']=u; st.session_state['role']=match.iloc[0]['Role']
-                    # Load Profile Pic
                     if 'ProfilePic' in match.columns and str(match.iloc[0]['ProfilePic']).startswith('http'):
                         st.session_state['user_pic'] = match.iloc[0]['ProfilePic']
                     st.query_params["user"]=u; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
@@ -304,18 +289,15 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        # Profile Section
         if st.session_state.get('user_pic'): st.image(st.session_state['user_pic'], width=100)
         else: st.image(LOGO_PATH, width=80) if os.path.exists(LOGO_PATH) else None
-        
         st.write(f"👤 **{st.session_state['username']}**"); st.divider()
-        
-        opts=["Dashboard", "Raise Debit Note", "My Profile"] # Added Profile
+        opts=["Dashboard", "Raise Debit Note", "My Profile"]
         if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
-        sel=option_menu("Navigation", opts, icons=['grid', 'file-text', 'person-circle', 'building', 'people'])
+        sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'person-circle', 'building', 'people'])
         if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
 
-    # --- DASHBOARD (With Delete & Bulk Download) ---
+    # --- DASHBOARD (WITH CHARTS & TOOLS) ---
     if sel == "Dashboard":
         st.title("Dashboard")
         df = db_get("DebitNotes"); cons = db_get("Contractors")
@@ -325,7 +307,12 @@ def main():
             m1, m2, m3 = st.columns(3)
             m1.metric("Total", f"₹{df['Amount'].sum():,.0f}"); m2.metric("Count", len(df)); m3.metric("Last", df['Date'].max())
             
-            # --- 1. FILTER ---
+            # --- RESTORED CHARTS ---
+            c1, c2 = st.columns(2)
+            with c1: card_start(); st.subheader("Category Breakdown"); st.bar_chart(df.groupby('Category')['Amount'].sum() if 'Category' in df.columns else []); card_end()
+            with c2: card_start(); st.subheader("Top Contractors"); st.bar_chart(df.groupby('Contractor Name')['Amount'].sum()); card_end()
+            
+            # --- FILTER ---
             card_start()
             c1, c2 = st.columns([2, 1])
             con_options = ["All"] + cons['Name'].tolist() if not cons.empty else ["All"]
@@ -334,81 +321,63 @@ def main():
             df = df.sort_values(by="Date", ascending=False)
             card_end()
             
-            # --- 2. LIST WITH DELETE ---
+            # --- LIST WITH DELETE ---
             st.subheader("Records")
             for i, row in df.iterrows():
                 with st.expander(f"{row['Date']} | {row['Contractor Name']} | ₹{row['Amount']}"):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"**Reason:** {row['Reason']}")
                     if str(row['PDF Link']).startswith('http'): c1.link_button("View PDF", row['PDF Link'])
-                    
-                    # DELETE BUTTON (Admin or Owner)
                     if st.session_state['role'] == "Admin" or row['SubmittedBy'] == st.session_state['username']:
                         if c2.button("🗑️ Delete", key=f"del_{row['ID']}"):
-                            if db_delete_row("DebitNotes", "ID", row['ID']):
-                                st.success("Deleted!"); time.sleep(1); st.rerun()
+                            if db_delete_row("DebitNotes", "ID", row['ID']): st.success("Deleted!"); time.sleep(1); st.rerun()
 
-        # --- 3. BULK MERGE TOOL ---
+        # --- BULK MERGE TOOL ---
         st.markdown("---")
         if st.button("📥 Download Tools (Statement / Merge)"): st.session_state['show_gen'] = True
         if st.session_state.get('show_gen'):
             card_start(); st.subheader("Download Center")
             mc = st.selectbox("Contractor", df['Contractor Name'].unique())
             mdr = st.date_input("Period", [])
-            
             col_a, col_b = st.columns(2)
-            # A. Standard Statement
             if col_a.button("📄 Account Statement"):
                 mask = (df['Contractor Name'] == mc) & (pd.to_datetime(df['Date']).dt.date >= mdr[0]) & (pd.to_datetime(df['Date']).dt.date <= mdr[1])
                 f_df = df[mask]
                 if not f_df.empty:
                     path = create_pdf("statement", {"contractor": mc, "start": mdr[0], "end": mdr[1], "df": f_df})
                     with open(path, "rb") as f: st.download_button("Download Statement PDF", f, file_name="Statement.pdf")
-            
-            # B. Bulk Merge (NEW)
             if col_b.button("📚 Merge All Debit Notes"):
                 mask = (df['Contractor Name'] == mc) & (pd.to_datetime(df['Date']).dt.date >= mdr[0]) & (pd.to_datetime(df['Date']).dt.date <= mdr[1])
                 f_df = df[mask]
                 links = f_df['PDF Link'].tolist()
                 valid_links = [l for l in links if str(l).startswith('http')]
-                
                 if valid_links:
-                    with st.spinner(f"Merging {len(valid_links)} PDFs... this may take a moment."):
+                    with st.spinner(f"Merging {len(valid_links)} PDFs..."):
                         try:
                             merged_bytes = merge_pdfs(valid_links)
                             st.download_button("Download Merged Bundle", merged_bytes, file_name="Merged_Debit_Notes.pdf", mime="application/pdf")
                         except Exception as e: st.error(f"Merge failed: {e}")
-                else: st.warning("No PDF links found for this selection.")
+                else: st.warning("No PDF links found.")
             card_end()
 
-    # --- MY PROFILE (NEW) ---
+    # --- MY PROFILE ---
     elif sel == "My Profile":
-        st.title("My Profile")
-        card_start()
+        st.title("My Profile"); card_start()
         with st.form("prof_up"):
             new_user = st.text_input("Username", value=st.session_state['username'])
-            new_pass = st.text_input("New Password (Leave blank to keep current)", type="password")
+            new_pass = st.text_input("New Password (Leave blank to keep)", type="password")
             pic_file = st.file_uploader("Update Profile Photo", type=['jpg', 'png'])
-            
             if st.form_submit_button("Update Profile"):
                 pic_link = None
-                if pic_file:
-                    cp = compress_image(pic_file)
-                    pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
-                
+                if pic_file: cp = compress_image(pic_file); pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
                 if db_update_user(st.session_state['username'], new_user, new_pass, pic_link):
-                    st.success("Profile Updated! Please re-login.")
-                    time.sleep(2)
-                    st.session_state['auth'] = False
-                    st.query_params.clear()
-                    st.rerun()
+                    st.success("Updated! Re-login required."); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
                 else: st.error("Update Failed")
         card_end()
 
-    # --- RAISE DEBIT NOTE (Existing) ---
+    # --- RAISE DEBIT NOTE ---
     elif sel == "Raise Debit Note":
-        st.title("Raise Debit Note")
-        card_start()
+        st.title("Raise Debit Note"); card_start()
         st.write("🎙️ **Voice Description** (Record -> Speak -> Stop)")
         audio = mic_recorder(start_prompt="Record", stop_prompt="Stop", key='recorder')
         if audio: st.session_state['voice_text'] = transcribe_audio(audio['bytes']); st.success("Audio captured!")
@@ -437,15 +406,12 @@ def main():
                 if files:
                     for f in files: cp = compress_image(f); imgs.append(cp); links.append(upload_to_drive(cp, f.name, "image/jpeg"))
                 sig_path = compress_image(sig_file) if sig_file else None
-                
                 data = {"contractor": con, "date": str(dt), "amount": amt, "category": cat, "reason": reason, "site": site, "local_img_paths": imgs, "signature_path": sig_path}
                 pdf_path = create_pdf("receipt", data); pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
                 db_insert("DebitNotes", [int(datetime.now().timestamp()), con, str(dt), amt, cat, reason, site, ",".join(links), pdf_link, st.session_state['username']])
-                
                 con_row = cons[cons['Name'] == con]
                 if not con_row.empty and 'Email' in con_row.columns and str(con_row.iloc[0]['Email']) != "":
                     send_email_with_pdf([con_row.iloc[0]['Email']], f"Debit Note - {con}", f"Debit Note Raised (INR {amt})", pdf_path); st.toast("Email sent")
-                
                 st.session_state['cam_buffer'] = []; reset_form(); time.sleep(1); st.rerun()
         card_end()
 
@@ -467,5 +433,4 @@ def main():
         with c2: st.dataframe(db_get("Users"), use_container_width=True)
 
 if __name__ == "__main__":
-
     main()
