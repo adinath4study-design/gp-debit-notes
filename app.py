@@ -17,7 +17,7 @@ from email import encoders
 import speech_recognition as sr
 from streamlit_mic_recorder import mic_recorder
 import io
-from PIL import Image
+from PIL import Image, ImageOps, ImageDraw
 from pypdf import PdfWriter
 import re
 
@@ -41,21 +41,13 @@ def get_drive_service():
 def upload_to_drive(file_path, filename, mime_type):
     service = get_drive_service()
     folder_id = st.secrets["drive_settings"]["folder_id"]
-    
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype=mime_type)
-    
-    file = service.files().create(
-        body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
-    ).execute()
+    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True).execute()
     file_id = file.get('id')
-    
     try:
-        service.permissions().create(
-            fileId=file_id, body={'type': 'anyone', 'role': 'reader'}, supportsAllDrives=True
-        ).execute()
+        service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}, supportsAllDrives=True).execute()
     except: pass
-    
     return file.get('webViewLink')
 
 # --- 3. HELPER FUNCTIONS ---
@@ -107,9 +99,16 @@ def compress_image(image_input):
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
     audio_file = io.BytesIO(audio_bytes)
-    with sr.AudioFile(audio_file) as source: audio = r.record(source)
-    try: return r.recognize_google(audio)
-    except: return "Could not understand audio"
+    try:
+        with sr.AudioFile(audio_file) as source:
+            audio = r.record(source)
+        return r.recognize_google(audio)
+    except sr.UnknownValueError:
+        return "Could not understand audio (Speak clearer)"
+    except sr.RequestError:
+        return "Speech Service Unavailable (Check Internet)"
+    except Exception as e:
+        return f"Error: {e}"
 
 def send_email_with_pdf(to_emails, subject, body, attachment_path):
     if not to_emails or "email_settings" not in st.secrets: return False
@@ -248,7 +247,9 @@ def inject_css():
     t = THEMES["Corporate Blue"]
     st.markdown(f"""<style>.stApp {{ background-color: {t['bg']}; color: {t['text']}; }}
         .glass-card {{background: {t['card']}; backdrop-filter: blur(10px); border-radius: 16px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px;}}
-        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}</style>""", unsafe_allow_html=True)
+        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}
+        .profile-pic {{border-radius: 50%; width: 100px; height: 100px; object-fit: cover; display: block; margin-left: auto; margin-right: auto;}}
+        </style>""", unsafe_allow_html=True)
 def card_start(): st.markdown('<div class="glass-card">', unsafe_allow_html=True)
 def card_end(): st.markdown('</div>', unsafe_allow_html=True)
 def reset_form():
@@ -275,29 +276,35 @@ def main():
     if not st.session_state['auth']:
         c1,c2,c3=st.columns([1,1,1])
         with c2: 
-            card_start(); st.title("Login"); u=st.text_input("User"); p=st.text_input("Pass", type="password")
+            card_start(); st.title("Login"); u=st.text_input("User").strip(); p=st.text_input("Pass", type="password").strip()
             if st.button("Log In"):
-                users=db_get("Users"); match=users[(users['Username']==u)&(users['Password']==p)]
+                users=db_get("Users")
+                match = users[(users['Username'].astype(str).str.strip().str.lower() == u.lower()) & (users['Password'].astype(str).str.strip() == p)]
                 if not match.empty:
-                    st.session_state['auth']=True; st.session_state['username']=u; st.session_state['role']=match.iloc[0]['Role']
+                    st.session_state['auth']=True; st.session_state['username']=match.iloc[0]['Username']; st.session_state['role']=match.iloc[0]['Role']
                     if 'ProfilePic' in match.columns and str(match.iloc[0]['ProfilePic']).startswith('http'):
                         st.session_state['user_pic'] = match.iloc[0]['ProfilePic']
-                    st.query_params["user"]=u; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
+                    st.query_params["user"]=match.iloc[0]['Username']; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
                 else: st.error("Invalid")
             card_end()
         return
 
-    # Sidebar
+    # Sidebar (Profile Picture Enhanced)
     with st.sidebar:
-        if st.session_state.get('user_pic'): st.image(st.session_state['user_pic'], width=100)
-        else: st.image(LOGO_PATH, width=80) if os.path.exists(LOGO_PATH) else None
-        st.write(f"👤 **{st.session_state['username']}**"); st.divider()
+        if st.session_state.get('user_pic'): 
+            st.markdown(f'<img src="{st.session_state["user_pic"]}" class="profile-pic">', unsafe_allow_html=True)
+        else: 
+            st.image(LOGO_PATH, width=80) if os.path.exists(LOGO_PATH) else st.write("👤")
+        
+        st.markdown(f"<h3 style='text-align: center;'>{st.session_state['username']}</h3>", unsafe_allow_html=True)
+        st.divider()
+        
         opts=["Dashboard", "Raise Debit Note", "My Profile"]
         if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
         sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'person-circle', 'building', 'people'])
         if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
 
-    # --- DASHBOARD (WITH CHARTS & TOOLS) ---
+    # --- DASHBOARD ---
     if sel == "Dashboard":
         st.title("Dashboard")
         df = db_get("DebitNotes"); cons = db_get("Contractors")
@@ -307,12 +314,10 @@ def main():
             m1, m2, m3 = st.columns(3)
             m1.metric("Total", f"₹{df['Amount'].sum():,.0f}"); m2.metric("Count", len(df)); m3.metric("Last", df['Date'].max())
             
-            # --- RESTORED CHARTS ---
             c1, c2 = st.columns(2)
             with c1: card_start(); st.subheader("Category Breakdown"); st.bar_chart(df.groupby('Category')['Amount'].sum() if 'Category' in df.columns else []); card_end()
             with c2: card_start(); st.subheader("Top Contractors"); st.bar_chart(df.groupby('Contractor Name')['Amount'].sum()); card_end()
             
-            # --- FILTER ---
             card_start()
             c1, c2 = st.columns([2, 1])
             con_options = ["All"] + cons['Name'].tolist() if not cons.empty else ["All"]
@@ -321,7 +326,6 @@ def main():
             df = df.sort_values(by="Date", ascending=False)
             card_end()
             
-            # --- LIST WITH DELETE ---
             st.subheader("Records")
             for i, row in df.iterrows():
                 with st.expander(f"{row['Date']} | {row['Contractor Name']} | ₹{row['Amount']}"):
@@ -332,7 +336,6 @@ def main():
                         if c2.button("🗑️ Delete", key=f"del_{row['ID']}"):
                             if db_delete_row("DebitNotes", "ID", row['ID']): st.success("Deleted!"); time.sleep(1); st.rerun()
 
-        # --- BULK MERGE TOOL ---
         st.markdown("---")
         if st.button("📥 Download Tools (Statement / Merge)"): st.session_state['show_gen'] = True
         if st.session_state.get('show_gen'):
@@ -360,27 +363,52 @@ def main():
                 else: st.warning("No PDF links found.")
             card_end()
 
-    # --- MY PROFILE ---
+    # --- MY PROFILE (ENHANCED) ---
     elif sel == "My Profile":
         st.title("My Profile"); card_start()
+        
+        # Display current pic in large circle
+        if st.session_state.get('user_pic'):
+            st.markdown(f'<div style="display:flex;justify-content:center;"><img src="{st.session_state["user_pic"]}" style="border-radius:50%;width:150px;height:150px;object-fit:cover;"></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div style="display:flex;justify-content:center;font-size:100px;">👤</div>', unsafe_allow_html=True)
+        
+        st.markdown(f"<h2 style='text-align: center;'>{st.session_state['username']}</h2>", unsafe_allow_html=True)
+        st.divider()
+
         with st.form("prof_up"):
+            st.write("Edit Details:")
             new_user = st.text_input("Username", value=st.session_state['username'])
             new_pass = st.text_input("New Password (Leave blank to keep)", type="password")
-            pic_file = st.file_uploader("Update Profile Photo", type=['jpg', 'png'])
-            if st.form_submit_button("Update Profile"):
+            pic_file = st.file_uploader("Change Profile Photo", type=['jpg', 'png'])
+            
+            if st.form_submit_button("Save Changes"):
                 pic_link = None
-                if pic_file: cp = compress_image(pic_file); pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
+                if pic_file: 
+                    cp = compress_image(pic_file)
+                    pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
+                
                 if db_update_user(st.session_state['username'], new_user, new_pass, pic_link):
-                    st.success("Updated! Re-login required."); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
+                    st.success("Updated Successfully! Please re-login to see changes.")
+                    time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
                 else: st.error("Update Failed")
         card_end()
 
     # --- RAISE DEBIT NOTE ---
     elif sel == "Raise Debit Note":
         st.title("Raise Debit Note"); card_start()
-        st.write("🎙️ **Voice Description** (Record -> Speak -> Stop)")
-        audio = mic_recorder(start_prompt="Record", stop_prompt="Stop", key='recorder')
-        if audio: st.session_state['voice_text'] = transcribe_audio(audio['bytes']); st.success("Audio captured!")
+        
+        # --- FIXED VOICE RECORDER ---
+        st.write("🎙️ **Voice Description**")
+        # FORMAT='wav' IS CRITICAL FOR BROWSER COMPATIBILITY
+        audio = mic_recorder(start_prompt="Click to Speak", stop_prompt="Stop Recording", key='recorder', format='wav')
+        
+        if audio: 
+            with st.spinner("Transcribing..."):
+                text = transcribe_audio(audio['bytes'])
+                st.session_state['voice_text'] = text
+                if "Error" in text or "Could not" in text: st.warning(text)
+                else: st.success("Captured!")
 
         with st.form("dn_form"):
             cons = db_get("Contractors"); c_list = cons['Name'].tolist() if not cons.empty else []
