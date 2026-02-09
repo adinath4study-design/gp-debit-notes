@@ -17,8 +17,9 @@ from email import encoders
 import speech_recognition as sr
 from streamlit_mic_recorder import mic_recorder
 import io
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image
 from pypdf import PdfWriter
+from streamlit_cropper import st_cropper # NEW: For WhatsApp-style cropping
 import re
 
 # --- 1. CONFIGURATION ---
@@ -43,14 +44,31 @@ def upload_to_drive(file_path, filename, mime_type):
     folder_id = st.secrets["drive_settings"]["folder_id"]
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype=mime_type)
-    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True).execute()
+    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink, webContentLink', supportsAllDrives=True).execute()
     file_id = file.get('id')
     try:
         service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}, supportsAllDrives=True).execute()
     except: pass
-    return file.get('webViewLink')
+    
+    # Return webContentLink (Download Link) which is often better for embedding, fallback to webViewLink
+    return file.get('webContentLink', file.get('webViewLink'))
 
 # --- 3. HELPER FUNCTIONS ---
+def safe_image(image_source, width=None, caption=None):
+    """Safely renders an image. If missing/broken, renders a placeholder."""
+    try:
+        if not image_source: raise ValueError("No source")
+        # Check if local file exists
+        if not str(image_source).startswith('http') and not os.path.exists(image_source):
+            raise FileNotFoundError("Local file missing")
+        
+        # Render
+        if width: st.image(image_source, width=width, caption=caption)
+        else: st.image(image_source, caption=caption)
+    except:
+        # Fallback for broken images
+        st.markdown(f"🖼️ *{caption if caption else 'Image'}*")
+
 def get_file_id_from_url(url):
     match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else None
@@ -78,7 +96,12 @@ def merge_pdfs(pdf_links):
 
 def compress_image(image_input):
     if not os.path.exists("temp"): os.makedirs("temp")
-    if isinstance(image_input, bytes):
+    
+    # Handle PIL Image (from Cropper) vs Bytes/File
+    if isinstance(image_input, Image.Image):
+        img = image_input
+        filename = f"crop_{int(datetime.now().timestamp())}.jpg"
+    elif isinstance(image_input, bytes):
         img = Image.open(io.BytesIO(image_input))
         filename = f"cam_{int(datetime.now().timestamp())}.jpg"
     else:
@@ -100,15 +123,9 @@ def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
     audio_file = io.BytesIO(audio_bytes)
     try:
-        with sr.AudioFile(audio_file) as source:
-            audio = r.record(source)
+        with sr.AudioFile(audio_file) as source: audio = r.record(source)
         return r.recognize_google(audio)
-    except sr.UnknownValueError:
-        return "Could not understand audio (Speak clearer)"
-    except sr.RequestError:
-        return "Speech Service Unavailable (Check Internet)"
-    except Exception as e:
-        return f"Error: {e}"
+    except: return "Could not understand audio"
 
 def send_email_with_pdf(to_emails, subject, body, attachment_path):
     if not to_emails or "email_settings" not in st.secrets: return False
@@ -173,9 +190,7 @@ def db_update_user(old_username, new_username, new_password, new_pic_link):
 def db_delete_row(table, col_name, value):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
     try:
-        cell = ws.find(str(value))
-        ws.delete_rows(cell.row)
-        return True
+        cell = ws.find(str(value)); ws.delete_rows(cell.row); return True
     except: return False
 
 # --- 5. PDF ENGINE ---
@@ -248,7 +263,7 @@ def inject_css():
     st.markdown(f"""<style>.stApp {{ background-color: {t['bg']}; color: {t['text']}; }}
         .glass-card {{background: {t['card']}; backdrop-filter: blur(10px); border-radius: 16px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px;}}
         .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}
-        .profile-pic {{border-radius: 50%; width: 100px; height: 100px; object-fit: cover; display: block; margin-left: auto; margin-right: auto;}}
+        .profile-pic {{border-radius: 50%; width: 100px; height: 100px; object-fit: cover; display: block; margin-left: auto; margin-right: auto; border: 3px solid {t['primary']};}}
         </style>""", unsafe_allow_html=True)
 def card_start(): st.markdown('<div class="glass-card">', unsafe_allow_html=True)
 def card_end(): st.markdown('</div>', unsafe_allow_html=True)
@@ -289,12 +304,12 @@ def main():
             card_end()
         return
 
-    # Sidebar (Profile Picture Enhanced)
+    # Sidebar (Safe Image Render)
     with st.sidebar:
         if st.session_state.get('user_pic'): 
             st.markdown(f'<img src="{st.session_state["user_pic"]}" class="profile-pic">', unsafe_allow_html=True)
         else: 
-            st.image(LOGO_PATH, width=80) if os.path.exists(LOGO_PATH) else st.write("👤")
+            safe_image(LOGO_PATH, width=100)
         
         st.markdown(f"<h3 style='text-align: center;'>{st.session_state['username']}</h3>", unsafe_allow_html=True)
         st.divider()
@@ -363,11 +378,10 @@ def main():
                 else: st.warning("No PDF links found.")
             card_end()
 
-    # --- MY PROFILE (ENHANCED) ---
+    # --- MY PROFILE (CROPPER & UPLOADER) ---
     elif sel == "My Profile":
         st.title("My Profile"); card_start()
         
-        # Display current pic in large circle
         if st.session_state.get('user_pic'):
             st.markdown(f'<div style="display:flex;justify-content:center;"><img src="{st.session_state["user_pic"]}" style="border-radius:50%;width:150px;height:150px;object-fit:cover;"></div>', unsafe_allow_html=True)
         else:
@@ -379,18 +393,28 @@ def main():
         with st.form("prof_up"):
             st.write("Edit Details:")
             new_user = st.text_input("Username", value=st.session_state['username'])
-            new_pass = st.text_input("New Password (Leave blank to keep)", type="password")
-            pic_file = st.file_uploader("Change Profile Photo", type=['jpg', 'png'])
+            new_pass = st.text_input("New Password", type="password")
+            
+            # --- CROPPER LOGIC ---
+            st.write("Update Profile Photo:")
+            pic_file = st.file_uploader("Upload Image", type=['jpg', 'png'])
+            cropped_img = None
+            if pic_file:
+                st.write("Adjust Selection:")
+                # Real-time Cropper
+                cropped_img = st_cropper(Image.open(pic_file), aspectRatio=1, boxColor='#0000FF', keys='crop')
+                st.caption("Preview of Cropped Image:")
+                st.image(cropped_img, width=150)
             
             if st.form_submit_button("Save Changes"):
                 pic_link = None
-                if pic_file: 
-                    cp = compress_image(pic_file)
+                if cropped_img:
+                    # Save Cropped Image
+                    cp = compress_image(cropped_img) # Compress the PIL image directly
                     pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
                 
                 if db_update_user(st.session_state['username'], new_user, new_pass, pic_link):
-                    st.success("Updated Successfully! Please re-login to see changes.")
-                    time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
+                    st.success("Updated Successfully!"); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
                 else: st.error("Update Failed")
         card_end()
 
@@ -398,11 +422,8 @@ def main():
     elif sel == "Raise Debit Note":
         st.title("Raise Debit Note"); card_start()
         
-        # --- FIXED VOICE RECORDER ---
         st.write("🎙️ **Voice Description**")
-        # FORMAT='wav' IS CRITICAL FOR BROWSER COMPATIBILITY
         audio = mic_recorder(start_prompt="Click to Speak", stop_prompt="Stop Recording", key='recorder', format='wav')
-        
         if audio: 
             with st.spinner("Transcribing..."):
                 text = transcribe_audio(audio['bytes'])

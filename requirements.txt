@@ -1,7 +1,6 @@
 streamlit
 pandas
 fpdf
-pypdf
 gspread
 google-auth
 google-api-python-client
@@ -9,3 +8,5 @@ streamlit-option-menu
 SpeechRecognition
 streamlit-mic-recorder
 Pillow
+pypdf
+streamlit-cropper
