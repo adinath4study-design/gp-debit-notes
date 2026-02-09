@@ -19,7 +19,7 @@ from streamlit_mic_recorder import mic_recorder
 import io
 from PIL import Image
 from pypdf import PdfWriter
-from streamlit_cropper import st_cropper # NEW: For WhatsApp-style cropping
+from streamlit_cropper import st_cropper
 import re
 
 # --- 1. CONFIGURATION ---
@@ -49,25 +49,20 @@ def upload_to_drive(file_path, filename, mime_type):
     try:
         service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}, supportsAllDrives=True).execute()
     except: pass
-    
-    # Return webContentLink (Download Link) which is often better for embedding, fallback to webViewLink
     return file.get('webContentLink', file.get('webViewLink'))
 
 # --- 3. HELPER FUNCTIONS ---
 def safe_image(image_source, width=None, caption=None):
-    """Safely renders an image. If missing/broken, renders a placeholder."""
+    """Safely renders an image. If missing, renders nothing or placeholder."""
     try:
-        if not image_source: raise ValueError("No source")
-        # Check if local file exists
-        if not str(image_source).startswith('http') and not os.path.exists(image_source):
-            raise FileNotFoundError("Local file missing")
+        if not image_source: return
+        # If local file, check existence
+        if not str(image_source).startswith('http'):
+            if not os.path.exists(image_source): return 
         
-        # Render
         if width: st.image(image_source, width=width, caption=caption)
         else: st.image(image_source, caption=caption)
-    except:
-        # Fallback for broken images
-        st.markdown(f"🖼️ *{caption if caption else 'Image'}*")
+    except: pass
 
 def get_file_id_from_url(url):
     match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
@@ -97,7 +92,6 @@ def merge_pdfs(pdf_links):
 def compress_image(image_input):
     if not os.path.exists("temp"): os.makedirs("temp")
     
-    # Handle PIL Image (from Cropper) vs Bytes/File
     if isinstance(image_input, Image.Image):
         img = image_input
         filename = f"crop_{int(datetime.now().timestamp())}.jpg"
@@ -304,12 +298,12 @@ def main():
             card_end()
         return
 
-    # Sidebar (Safe Image Render)
+    # Sidebar
     with st.sidebar:
         if st.session_state.get('user_pic'): 
             st.markdown(f'<img src="{st.session_state["user_pic"]}" class="profile-pic">', unsafe_allow_html=True)
         else: 
-            safe_image(LOGO_PATH, width=100)
+            safe_image(LOGO_PATH, width=80) # Safe check for logo
         
         st.markdown(f"<h3 style='text-align: center;'>{st.session_state['username']}</h3>", unsafe_allow_html=True)
         st.divider()
@@ -378,10 +372,11 @@ def main():
                 else: st.warning("No PDF links found.")
             card_end()
 
-    # --- MY PROFILE (CROPPER & UPLOADER) ---
+    # --- MY PROFILE (FIXED INTERACTIVE MODE) ---
     elif sel == "My Profile":
         st.title("My Profile"); card_start()
         
+        # Display Current Photo
         if st.session_state.get('user_pic'):
             st.markdown(f'<div style="display:flex;justify-content:center;"><img src="{st.session_state["user_pic"]}" style="border-radius:50%;width:150px;height:150px;object-fit:cover;"></div>', unsafe_allow_html=True)
         else:
@@ -390,32 +385,36 @@ def main():
         st.markdown(f"<h2 style='text-align: center;'>{st.session_state['username']}</h2>", unsafe_allow_html=True)
         st.divider()
 
-        with st.form("prof_up"):
-            st.write("Edit Details:")
-            new_user = st.text_input("Username", value=st.session_state['username'])
-            new_pass = st.text_input("New Password", type="password")
+        # Step 1: Upload & Crop (Interactive - OUTSIDE FORM)
+        st.write("📸 **Update Profile Photo**")
+        pic_file = st.file_uploader("Upload New Image", type=['jpg', 'png'])
+        cropped_img = None
+        if pic_file:
+            st.caption("Adjust box to crop face:")
+            cropped_img = st_cropper(Image.open(pic_file), aspectRatio=1, boxColor='#0000FF', keys='crop')
+            st.caption("Preview:")
+            st.image(cropped_img, width=150)
+        
+        st.divider()
+
+        # Step 2: Edit Text Details (Interactive - NO FORM)
+        st.write("✏️ **Edit Details**")
+        new_user = st.text_input("Username", value=st.session_state['username'])
+        new_pass = st.text_input("New Password", type="password")
+
+        # Step 3: Save Button
+        if st.button("💾 Save Profile Changes"):
+            pic_link = None
+            # If user cropped a new image, save it
+            if cropped_img:
+                cp = compress_image(cropped_img) 
+                pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
             
-            # --- CROPPER LOGIC ---
-            st.write("Update Profile Photo:")
-            pic_file = st.file_uploader("Upload Image", type=['jpg', 'png'])
-            cropped_img = None
-            if pic_file:
-                st.write("Adjust Selection:")
-                # Real-time Cropper
-                cropped_img = st_cropper(Image.open(pic_file), aspectRatio=1, boxColor='#0000FF', keys='crop')
-                st.caption("Preview of Cropped Image:")
-                st.image(cropped_img, width=150)
-            
-            if st.form_submit_button("Save Changes"):
-                pic_link = None
-                if cropped_img:
-                    # Save Cropped Image
-                    cp = compress_image(cropped_img) # Compress the PIL image directly
-                    pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
-                
-                if db_update_user(st.session_state['username'], new_user, new_pass, pic_link):
-                    st.success("Updated Successfully!"); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
-                else: st.error("Update Failed")
+            # Update DB
+            if db_update_user(st.session_state['username'], new_user, new_pass, pic_link):
+                st.success("Updated Successfully!"); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
+            else: st.error("Update Failed")
+        
         card_end()
 
     # --- RAISE DEBIT NOTE ---
