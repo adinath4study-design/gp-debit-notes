@@ -21,13 +21,13 @@ from PIL import Image
 from pypdf import PdfWriter
 from streamlit_cropper import st_cropper
 import re
-import uuid  # Standard Lib: For unique filenames
-import shutil # Standard Lib: For file deletion
+import uuid
+import shutil
 
 # --- 1. CONFIGURATION ---
 COMPANY_NAME = "G P Group"
 LOGO_PATH = "logo.png"
-PROFILE_PICS_DIR = "static/profile_pics" # Local Storage for Speed
+PROFILE_PICS_DIR = "static/profile_pics"
 REASON_CATEGORIES = ["Safety Violation", "Quality Issue", "Material Wastage", "Timeline Delay", "Site Misconduct", "Other"]
 
 # --- 2. GOOGLE SERVICES ---
@@ -56,54 +56,36 @@ def upload_to_drive(file_path, filename, mime_type):
 
 # --- 3. HELPER FUNCTIONS ---
 def init_filesystem():
-    """Creates necessary directories on startup"""
     if not os.path.exists("temp"): os.makedirs("temp")
     if not os.path.exists(PROFILE_PICS_DIR): os.makedirs(PROFILE_PICS_DIR)
 
 def save_profile_pic_local(image_input, old_filename=None):
-    """
-    Saves profile pic locally (WhatsApp Style).
-    1. Resizes to 500x500
-    2. Generates unique UUID filename
-    3. Deletes old file to save space
-    """
-    # 1. Process Image
     if isinstance(image_input, bytes):
         img = Image.open(io.BytesIO(image_input))
     else:
-        img = image_input # It's already a PIL Image from Cropper
+        img = image_input
 
     if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-    
-    # 2. Resize to 500x500 (WhatsApp Standard)
     img = img.resize((500, 500), Image.Resampling.LANCZOS)
     
-    # 3. Generate Unique Filename
     unique_name = f"{uuid.uuid4().hex}.jpg"
     save_path = os.path.join(PROFILE_PICS_DIR, unique_name)
-    
-    # 4. Save
     img.save(save_path, "JPEG", quality=85, optimize=True)
     
-    # 5. Clean up old image
     if old_filename and old_filename != "None" and old_filename is not None:
         old_path = os.path.join(PROFILE_PICS_DIR, old_filename)
         if os.path.exists(old_path):
             try: os.remove(old_path)
             except: pass
-            
     return unique_name
 
 def safe_profile_display(filename):
-    """Returns the path to the profile pic, or None"""
     if filename and filename != "None":
         path = os.path.join(PROFILE_PICS_DIR, filename)
-        if os.path.exists(path):
-            return path
+        if os.path.exists(path): return path
     return None 
 
 def safe_image(image_source, width=None, caption=None):
-    """Safely renders an image."""
     try:
         if not image_source: return
         if not str(image_source).startswith('http'):
@@ -191,7 +173,7 @@ def init_db():
         tables = {
             "DebitNotes": ["ID", "Contractor Name", "Date", "Amount", "Category", "Reason", "Site Location", "Image Links", "PDF Link", "SubmittedBy"],
             "Contractors": ["ID", "Name", "Details", "Email"],
-            "Users": ["Username", "Password", "Role", "ProfilePic"], # NOW STORES LOCAL FILENAME
+            "Users": ["Username", "Password", "Role", "ProfilePic"],
             "Notifications": ["ID", "Message", "Timestamp", "Type"]
         }
         for name, headers in tables.items():
@@ -349,9 +331,8 @@ def main():
     with st.sidebar:
         dp_path = safe_profile_display(st.session_state.get('user_pic'))
         if dp_path:
-            st.image(dp_path, width=100) # Simple streamlit image because it's local now
+            st.image(dp_path, width=100)
         else:
-            # Fallback to Logo or generic user icon
             if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=80)
             else: st.markdown(f'<div style="display:flex;justify-content:center;font-size:80px;">👤</div>', unsafe_allow_html=True)
         
@@ -422,113 +403,8 @@ def main():
                 else: st.warning("No PDF links found.")
             card_end()
 
-    # --- MY PROFILE (LOCAL STORAGE) ---
+    # --- MY PROFILE ---
     elif sel == "My Profile":
         st.title("My Profile"); card_start()
         
-        # Display Current Photo (from local)
-        dp_path = safe_profile_display(st.session_state.get('user_pic'))
-        if dp_path:
-             st.image(dp_path, width=200, caption="Current Profile Picture")
-        else:
-             st.markdown(f'<div style="display:flex;justify-content:center;font-size:100px;">👤</div>', unsafe_allow_html=True)
-        
-        st.markdown(f"<h2 style='text-align: center;'>{st.session_state['username']}</h2>", unsafe_allow_html=True)
-        st.divider()
-
-        # Step 1: Upload & Crop
-        st.write("📸 **Update Profile Photo**")
-        pic_file = st.file_uploader("Upload New Image", type=['jpg', 'png'])
-        cropped_img = None
-        if pic_file:
-            st.caption("Adjust box to crop face:")
-            cropped_img = st_cropper(Image.open(pic_file), aspect_ratio=1, box_color='#0000FF', key='crop')
-            st.caption("Preview:")
-            st.image(cropped_img, width=150)
-        
-        st.divider()
-
-        # Step 2: Edit Text Details
-        st.write("✏️ **Edit Details**")
-        new_user = st.text_input("Username", value=st.session_state['username'])
-        new_pass = st.text_input("New Password", type="password")
-
-        # Step 3: Save Button
-        if st.button("💾 Save Profile Changes"):
-            new_pic_filename = None
-            if cropped_img:
-                # Save Local with UUID
-                new_pic_filename = save_profile_pic_local(cropped_img, st.session_state.get('user_pic'))
-            
-            # Update DB (Stores FILENAME, not URL)
-            if db_update_user(st.session_state['username'], new_user, new_pass, new_pic_filename):
-                st.success("Updated Successfully!"); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
-            else: st.error("Update Failed")
-        
-        card_end()
-
-    # --- RAISE DEBIT NOTE ---
-    elif sel == "Raise Debit Note":
-        st.title("Raise Debit Note"); card_start()
-        
-        st.write("🎙️ **Voice Description**")
-        audio = mic_recorder(start_prompt="Click to Speak", stop_prompt="Stop Recording", key='recorder', format='wav')
-        if audio: 
-            with st.spinner("Transcribing..."):
-                text = transcribe_audio(audio['bytes'])
-                st.session_state['voice_text'] = text
-                if "Error" in text or "Could not" in text: st.warning(text)
-                else: st.success("Captured!")
-
-        with st.form("dn_form"):
-            cons = db_get("Contractors"); c_list = cons['Name'].tolist() if not cons.empty else []
-            c1, c2 = st.columns(2); con = c1.selectbox("Contractor", c_list); dt = c2.date_input("Date")
-            c3, c4 = st.columns(2); cat = c3.selectbox("Category", REASON_CATEGORIES); amt = c4.number_input("Amount (INR)", min_value=0.0, key="dn_amt")
-            site = st.text_input("Site Location", key="dn_site"); reason = st.text_area("Reason", value=st.session_state.get('voice_text', ''), key="dn_reason")
-            
-            st.markdown("---"); st.write("**📸 Photos**")
-            if st.session_state['cam_buffer']:
-                cols = st.columns(min(len(st.session_state['cam_buffer']), 4) or 1)
-                for idx, img_bytes in enumerate(st.session_state['cam_buffer']):
-                    if idx < 4: cols[idx].image(img_bytes, width=100)
-                if st.form_submit_button("Clear Photos"): st.session_state['cam_buffer'] = []; st.rerun()
-            cam_img = st.camera_input("Take Photo", key=f"camera_{st.session_state['cam_counter']}")
-            if cam_img: st.session_state['cam_buffer'].append(cam_img.getvalue()); st.session_state['cam_counter'] += 1; st.rerun()
-            files = st.file_uploader("Or Upload", accept_multiple_files=True, key=f"uploader_{st.session_state['uploader_key']}")
-            
-            st.markdown("---"); st.write("**✍️ Signature**"); sig_file = st.file_uploader("Upload Sig", type=['png', 'jpg'], key="sig_up")
-            
-            if st.form_submit_button("Submit & Email"):
-                imgs, links = [], []
-                for b in st.session_state['cam_buffer']: cp = compress_image(b); imgs.append(cp); links.append(upload_to_drive(cp, "cam.jpg", "image/jpeg"))
-                if files:
-                    for f in files: cp = compress_image(f); imgs.append(cp); links.append(upload_to_drive(cp, f.name, "image/jpeg"))
-                sig_path = compress_image(sig_file) if sig_file else None
-                data = {"contractor": con, "date": str(dt), "amount": amt, "category": cat, "reason": reason, "site": site, "local_img_paths": imgs, "signature_path": sig_path}
-                pdf_path = create_pdf("receipt", data); pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
-                db_insert("DebitNotes", [int(datetime.now().timestamp()), con, str(dt), amt, cat, reason, site, ",".join(links), pdf_link, st.session_state['username']])
-                con_row = cons[cons['Name'] == con]
-                if not con_row.empty and 'Email' in con_row.columns and str(con_row.iloc[0]['Email']) != "":
-                    send_email_with_pdf([con_row.iloc[0]['Email']], f"Debit Note - {con}", f"Debit Note Raised (INR {amt})", pdf_path); st.toast("Email sent")
-                st.session_state['cam_buffer'] = []; reset_form(); time.sleep(1); st.rerun()
-        card_end()
-
-    # --- ADMIN PAGES ---
-    elif sel == "Contractors" and st.session_state['role'] == "Admin":
-        st.title("Contractors"); c1, c2 = st.columns([1, 2])
-        with c1:
-            with st.form("add_c"):
-                n = st.text_input("Name"); e = st.text_input("Email"); d = st.text_input("Details")
-                if st.form_submit_button("Add"): db_insert("Contractors", [int(datetime.now().timestamp()), n, d, e]); st.rerun()
-        with c2: st.dataframe(db_get("Contractors"), use_container_width=True)
-
-    elif sel == "User Management" and st.session_state['role'] == "Admin":
-        st.title("Users"); c1, c2 = st.columns(2)
-        with c1:
-            with st.form("add_u"):
-                u = st.text_input("User"); p = st.text_input("Pass", type="password"); r = st.selectbox("Role", ["Engineer", "Admin"])
-                if st.form_submit_button("Add"): db_insert("Users", [u, p, r]); st.rerun()
-        with c2: st.dataframe(db_get("Users"), use_container_width=True)
-
-if __name__ == "__main__":
-    main()
+        dp
