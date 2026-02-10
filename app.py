@@ -442,7 +442,7 @@ def main():
         cropped_img = None
         if pic_file:
             st.caption("Adjust box to crop face:")
-            cropped_img = st_cropper(Image.open(pic_file), aspect_ratio=1, boxColor='#0000FF', key='crop')
+            cropped_img = st_cropper(Image.open(pic_file), aspect_ratio=1, box_color='#0000FF', key='crop')
             st.caption("Preview:")
             st.image(cropped_img, width=150)
         
