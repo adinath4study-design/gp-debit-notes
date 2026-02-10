@@ -21,10 +21,13 @@ from PIL import Image
 from pypdf import PdfWriter
 from streamlit_cropper import st_cropper
 import re
+import uuid  # Standard Lib: For unique filenames
+import shutil # Standard Lib: For file deletion
 
 # --- 1. CONFIGURATION ---
 COMPANY_NAME = "G P Group"
 LOGO_PATH = "logo.png"
+PROFILE_PICS_DIR = "static/profile_pics" # Local Storage for Speed
 REASON_CATEGORIES = ["Safety Violation", "Quality Issue", "Material Wastage", "Timeline Delay", "Site Misconduct", "Other"]
 
 # --- 2. GOOGLE SERVICES ---
@@ -52,14 +55,59 @@ def upload_to_drive(file_path, filename, mime_type):
     return file.get('webContentLink', file.get('webViewLink'))
 
 # --- 3. HELPER FUNCTIONS ---
+def init_filesystem():
+    """Creates necessary directories on startup"""
+    if not os.path.exists("temp"): os.makedirs("temp")
+    if not os.path.exists(PROFILE_PICS_DIR): os.makedirs(PROFILE_PICS_DIR)
+
+def save_profile_pic_local(image_input, old_filename=None):
+    """
+    Saves profile pic locally (WhatsApp Style).
+    1. Resizes to 500x500
+    2. Generates unique UUID filename
+    3. Deletes old file to save space
+    """
+    # 1. Process Image
+    if isinstance(image_input, bytes):
+        img = Image.open(io.BytesIO(image_input))
+    else:
+        img = image_input # It's already a PIL Image from Cropper
+
+    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+    
+    # 2. Resize to 500x500 (WhatsApp Standard)
+    img = img.resize((500, 500), Image.Resampling.LANCZOS)
+    
+    # 3. Generate Unique Filename
+    unique_name = f"{uuid.uuid4().hex}.jpg"
+    save_path = os.path.join(PROFILE_PICS_DIR, unique_name)
+    
+    # 4. Save
+    img.save(save_path, "JPEG", quality=85, optimize=True)
+    
+    # 5. Clean up old image
+    if old_filename and old_filename != "None" and old_filename is not None:
+        old_path = os.path.join(PROFILE_PICS_DIR, old_filename)
+        if os.path.exists(old_path):
+            try: os.remove(old_path)
+            except: pass
+            
+    return unique_name
+
+def safe_profile_display(filename):
+    """Returns the path to the profile pic, or None"""
+    if filename and filename != "None":
+        path = os.path.join(PROFILE_PICS_DIR, filename)
+        if os.path.exists(path):
+            return path
+    return None 
+
 def safe_image(image_source, width=None, caption=None):
-    """Safely renders an image. If missing, renders nothing or placeholder."""
+    """Safely renders an image."""
     try:
         if not image_source: return
-        # If local file, check existence
         if not str(image_source).startswith('http'):
             if not os.path.exists(image_source): return 
-        
         if width: st.image(image_source, width=width, caption=caption)
         else: st.image(image_source, caption=caption)
     except: pass
@@ -91,7 +139,6 @@ def merge_pdfs(pdf_links):
 
 def compress_image(image_input):
     if not os.path.exists("temp"): os.makedirs("temp")
-    
     if isinstance(image_input, Image.Image):
         img = image_input
         filename = f"crop_{int(datetime.now().timestamp())}.jpg"
@@ -144,7 +191,7 @@ def init_db():
         tables = {
             "DebitNotes": ["ID", "Contractor Name", "Date", "Amount", "Category", "Reason", "Site Location", "Image Links", "PDF Link", "SubmittedBy"],
             "Contractors": ["ID", "Name", "Details", "Email"],
-            "Users": ["Username", "Password", "Role", "ProfilePic"],
+            "Users": ["Username", "Password", "Role", "ProfilePic"], # NOW STORES LOCAL FILENAME
             "Notifications": ["ID", "Message", "Timestamp", "Type"]
         }
         for name, headers in tables.items():
@@ -171,12 +218,12 @@ def db_insert(table, row_data):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
     ws.append_row(row_data)
 
-def db_update_user(old_username, new_username, new_password, new_pic_link):
+def db_update_user(old_username, new_username, new_password, new_pic_filename):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Users")
     try:
         cell = ws.find(old_username)
         if new_password: ws.update_cell(cell.row, 2, new_password)
-        if new_pic_link: ws.update_cell(cell.row, 4, new_pic_link)
+        if new_pic_filename: ws.update_cell(cell.row, 4, new_pic_filename)
         if new_username and new_username != old_username: ws.update_cell(cell.row, 1, new_username)
         return True
     except: return False
@@ -279,7 +326,7 @@ def main():
         else: st.session_state['auth'] = False
 
     inject_css(); 
-    if 'db_init' not in st.session_state: init_db(); st.session_state['db_init'] = True
+    if 'db_init' not in st.session_state: init_db(); init_filesystem(); st.session_state['db_init'] = True
 
     # Login
     if not st.session_state['auth']:
@@ -291,19 +338,22 @@ def main():
                 match = users[(users['Username'].astype(str).str.strip().str.lower() == u.lower()) & (users['Password'].astype(str).str.strip() == p)]
                 if not match.empty:
                     st.session_state['auth']=True; st.session_state['username']=match.iloc[0]['Username']; st.session_state['role']=match.iloc[0]['Role']
-                    if 'ProfilePic' in match.columns and str(match.iloc[0]['ProfilePic']).startswith('http'):
+                    if 'ProfilePic' in match.columns:
                         st.session_state['user_pic'] = match.iloc[0]['ProfilePic']
                     st.query_params["user"]=match.iloc[0]['Username']; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
                 else: st.error("Invalid")
             card_end()
         return
 
-    # Sidebar
+    # Sidebar (Display Local Profile Pic)
     with st.sidebar:
-        if st.session_state.get('user_pic'): 
-            st.markdown(f'<img src="{st.session_state["user_pic"]}" class="profile-pic">', unsafe_allow_html=True)
-        else: 
-            safe_image(LOGO_PATH, width=80) # Safe check for logo
+        dp_path = safe_profile_display(st.session_state.get('user_pic'))
+        if dp_path:
+            st.image(dp_path, width=100) # Simple streamlit image because it's local now
+        else:
+            # Fallback to Logo or generic user icon
+            if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=80)
+            else: st.markdown(f'<div style="display:flex;justify-content:center;font-size:80px;">👤</div>', unsafe_allow_html=True)
         
         st.markdown(f"<h3 style='text-align: center;'>{st.session_state['username']}</h3>", unsafe_allow_html=True)
         st.divider()
@@ -372,20 +422,21 @@ def main():
                 else: st.warning("No PDF links found.")
             card_end()
 
-    # --- MY PROFILE (FIXED INTERACTIVE MODE) ---
+    # --- MY PROFILE (LOCAL STORAGE) ---
     elif sel == "My Profile":
         st.title("My Profile"); card_start()
         
-        # Display Current Photo
-        if st.session_state.get('user_pic'):
-            st.markdown(f'<div style="display:flex;justify-content:center;"><img src="{st.session_state["user_pic"]}" style="border-radius:50%;width:150px;height:150px;object-fit:cover;"></div>', unsafe_allow_html=True)
+        # Display Current Photo (from local)
+        dp_path = safe_profile_display(st.session_state.get('user_pic'))
+        if dp_path:
+             st.image(dp_path, width=200, caption="Current Profile Picture")
         else:
-            st.markdown(f'<div style="display:flex;justify-content:center;font-size:100px;">👤</div>', unsafe_allow_html=True)
+             st.markdown(f'<div style="display:flex;justify-content:center;font-size:100px;">👤</div>', unsafe_allow_html=True)
         
         st.markdown(f"<h2 style='text-align: center;'>{st.session_state['username']}</h2>", unsafe_allow_html=True)
         st.divider()
 
-        # Step 1: Upload & Crop (Interactive - OUTSIDE FORM)
+        # Step 1: Upload & Crop
         st.write("📸 **Update Profile Photo**")
         pic_file = st.file_uploader("Upload New Image", type=['jpg', 'png'])
         cropped_img = None
@@ -397,21 +448,20 @@ def main():
         
         st.divider()
 
-        # Step 2: Edit Text Details (Interactive - NO FORM)
+        # Step 2: Edit Text Details
         st.write("✏️ **Edit Details**")
         new_user = st.text_input("Username", value=st.session_state['username'])
         new_pass = st.text_input("New Password", type="password")
 
         # Step 3: Save Button
         if st.button("💾 Save Profile Changes"):
-            pic_link = None
-            # If user cropped a new image, save it
+            new_pic_filename = None
             if cropped_img:
-                cp = compress_image(cropped_img) 
-                pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
+                # Save Local with UUID
+                new_pic_filename = save_profile_pic_local(cropped_img, st.session_state.get('user_pic'))
             
-            # Update DB
-            if db_update_user(st.session_state['username'], new_user, new_pass, pic_link):
+            # Update DB (Stores FILENAME, not URL)
+            if db_update_user(st.session_state['username'], new_user, new_pass, new_pic_filename):
                 st.success("Updated Successfully!"); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
             else: st.error("Update Failed")
         
