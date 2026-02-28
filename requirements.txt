@@ -10,3 +10,4 @@ streamlit-mic-recorder
 Pillow
 pypdf
 streamlit-cropper
+requests

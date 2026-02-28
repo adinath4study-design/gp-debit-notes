@@ -19,7 +19,15 @@ from streamlit_mic_recorder import mic_recorder
 import io
 from PIL import Image
 from pypdf import PdfWriter
+from streamlit_cropper import st_cropper
 import re
+import hashlib
+import math
+import requests
+import logging
+
+# Set up logging to eliminate "Silent Failures"
+logging.basicConfig(level=logging.INFO)
 
 # --- 1. CONFIGURATION ---
 COMPANY_NAME = "G P Group"
@@ -41,24 +49,50 @@ def get_drive_service():
 def upload_to_drive(file_path, filename, mime_type):
     service = get_drive_service()
     folder_id = st.secrets["drive_settings"]["folder_id"]
-    
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype=mime_type)
-    
-    file = service.files().create(
-        body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
-    ).execute()
+    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink, webContentLink', supportsAllDrives=True).execute()
     file_id = file.get('id')
-    
     try:
-        service.permissions().create(
-            fileId=file_id, body={'type': 'anyone', 'role': 'reader'}, supportsAllDrives=True
-        ).execute()
-    except: pass
-    
-    return file.get('webViewLink')
+        service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}, supportsAllDrives=True).execute()
+    except Exception as e: 
+        logging.error(f"Failed to set Drive permissions: {e}")
+    return file.get('webContentLink', file.get('webViewLink'))
 
 # --- 3. HELPER FUNCTIONS ---
+def hash_password(password):
+    """Encrypts passwords using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def save_profile_pic_drive(image_input, username):
+    """Replaces Local Storage to fix Ephemeral bug. Resizes and uploads DP to Drive."""
+    if not os.path.exists("temp"): os.makedirs("temp")
+    
+    if isinstance(image_input, bytes):
+        img = Image.open(io.BytesIO(image_input))
+    else:
+        img = image_input
+
+    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+    
+    # 500x500 WhatsApp Standard
+    img = img.resize((500, 500), Image.Resampling.LANCZOS)
+    
+    temp_path = f"temp/dp_{username}_{int(time.time())}.jpg"
+    img.save(temp_path, "JPEG", quality=85, optimize=True)
+    
+    link = upload_to_drive(temp_path, f"ProfilePic_{username}.jpg", "image/jpeg")
+    return link
+
+def safe_image(image_source, width=None, caption=None):
+    try:
+        if not image_source: return
+        if not str(image_source).startswith('http'):
+            if not os.path.exists(image_source): return 
+        if width: st.image(image_source, width=width, caption=caption)
+        else: st.image(image_source, caption=caption)
+    except: pass
+
 def get_file_id_from_url(url):
     match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else None
@@ -86,7 +120,10 @@ def merge_pdfs(pdf_links):
 
 def compress_image(image_input):
     if not os.path.exists("temp"): os.makedirs("temp")
-    if isinstance(image_input, bytes):
+    if isinstance(image_input, Image.Image):
+        img = image_input
+        filename = f"crop_{int(datetime.now().timestamp())}.jpg"
+    elif isinstance(image_input, bytes):
         img = Image.open(io.BytesIO(image_input))
         filename = f"cam_{int(datetime.now().timestamp())}.jpg"
     else:
@@ -107,9 +144,31 @@ def compress_image(image_input):
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
     audio_file = io.BytesIO(audio_bytes)
-    with sr.AudioFile(audio_file) as source: audio = r.record(source)
-    try: return r.recognize_google(audio)
+    try:
+        with sr.AudioFile(audio_file) as source: audio = r.record(source)
+        return r.recognize_google(audio)
     except: return "Could not understand audio"
+
+def send_whatsapp(to_number, body):
+    """Sends a WhatsApp message via Twilio API"""
+    if "whatsapp_settings" not in st.secrets: 
+        logging.info("WhatsApp bypassed: No secrets found.")
+        return False
+    try:
+        w = st.secrets["whatsapp_settings"]
+        sid = w["account_sid"]
+        token = w["auth_token"]
+        from_num = w["from_number"]
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+        data = {"From": f"whatsapp:{from_num}", "To": f"whatsapp:{to_number}", "Body": body}
+        res = requests.post(url, data=data, auth=(sid, token))
+        if res.status_code in [200, 201]: return True
+        else: 
+            logging.error(f"WhatsApp Failed: {res.text}")
+            return False
+    except Exception as e:
+        logging.error(f"WhatsApp Exception: {e}")
+        return False
 
 def send_email_with_pdf(to_emails, subject, body, attachment_path):
     if not to_emails or "email_settings" not in st.secrets: return False
@@ -124,7 +183,9 @@ def send_email_with_pdf(to_emails, subject, body, attachment_path):
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls(); server.login(sender_email, password)
         server.sendmail(sender_email, to_emails, msg.as_string()); server.quit(); return True
-    except: return False
+    except Exception as e: 
+        logging.error(f"Email Failed: {e}")
+        return False
 
 # --- 4. DATABASE OPERATIONS ---
 def init_db():
@@ -133,7 +194,7 @@ def init_db():
         sh = client.open_by_url(st.secrets["drive_settings"]["sheet_url"])
         tables = {
             "DebitNotes": ["ID", "Contractor Name", "Date", "Amount", "Category", "Reason", "Site Location", "Image Links", "PDF Link", "SubmittedBy"],
-            "Contractors": ["ID", "Name", "Details", "Email"],
+            "Contractors": ["ID", "Name", "Details", "Email", "Phone"], # Added Phone for WhatsApp
             "Users": ["Username", "Password", "Role", "ProfilePic"],
             "Notifications": ["ID", "Message", "Timestamp", "Type"]
         }
@@ -149,35 +210,45 @@ def init_db():
                 ws = sh.add_worksheet(name, 100, len(headers)); ws.append_row(headers)
     except Exception as e: st.error(f"DB Error: {e}")
 
+# CACHED TO MAKE DASHBOARD LIGHTNING FAST
+@st.cache_data(ttl=300)
 def db_get(table):
     try:
         ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
         data = ws.get_all_values()
         if len(data) < 2: return pd.DataFrame(columns=data[0] if data else None)
         return pd.DataFrame(data[1:], columns=data[0])
-    except: return pd.DataFrame()
+    except Exception as e: 
+        logging.error(f"DB Get Failed: {e}")
+        return pd.DataFrame()
 
 def db_insert(table, row_data):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
     ws.append_row(row_data)
+    db_get.clear() # Clear cache on new data
 
 def db_update_user(old_username, new_username, new_password, new_pic_link):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet("Users")
     try:
         cell = ws.find(old_username)
-        if new_password: ws.update_cell(cell.row, 2, new_password)
+        if new_password: ws.update_cell(cell.row, 2, hash_password(new_password)) # Hash before save
         if new_pic_link: ws.update_cell(cell.row, 4, new_pic_link)
         if new_username and new_username != old_username: ws.update_cell(cell.row, 1, new_username)
+        db_get.clear() # Clear cache
         return True
-    except: return False
+    except Exception as e: 
+        logging.error(f"Update User Failed: {e}")
+        return False
 
 def db_delete_row(table, col_name, value):
     ws = get_sheet_client().open_by_url(st.secrets["drive_settings"]["sheet_url"]).worksheet(table)
     try:
-        cell = ws.find(str(value))
-        ws.delete_rows(cell.row)
+        cell = ws.find(str(value)); ws.delete_rows(cell.row); 
+        db_get.clear() # Clear cache
         return True
-    except: return False
+    except Exception as e: 
+        logging.error(f"Delete Row Failed: {e}")
+        return False
 
 # --- 5. PDF ENGINE ---
 class PDF(FPDF):
@@ -248,7 +319,9 @@ def inject_css():
     t = THEMES["Corporate Blue"]
     st.markdown(f"""<style>.stApp {{ background-color: {t['bg']}; color: {t['text']}; }}
         .glass-card {{background: {t['card']}; backdrop-filter: blur(10px); border-radius: 16px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px;}}
-        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}</style>""", unsafe_allow_html=True)
+        .stButton>button {{background: linear-gradient(135deg, {t['primary']} 0%, {t['accent']} 100%); color: white; border: none;}}
+        .profile-pic {{border-radius: 50%; width: 100px; height: 100px; object-fit: cover; display: block; margin-left: auto; margin-right: auto; border: 3px solid {t['primary']};}}
+        </style>""", unsafe_allow_html=True)
 def card_start(): st.markdown('<div class="glass-card">', unsafe_allow_html=True)
 def card_end(): st.markdown('</div>', unsafe_allow_html=True)
 def reset_form():
@@ -271,33 +344,52 @@ def main():
     inject_css(); 
     if 'db_init' not in st.session_state: init_db(); st.session_state['db_init'] = True
 
-    # Login
+    # Login (WITH SECURE AUTO-MIGRATION HASHING)
     if not st.session_state['auth']:
         c1,c2,c3=st.columns([1,1,1])
         with c2: 
-            card_start(); st.title("Login"); u=st.text_input("User"); p=st.text_input("Pass", type="password")
+            card_start(); st.title("Login"); u=st.text_input("User").strip(); p=st.text_input("Pass", type="password").strip()
             if st.button("Log In"):
-                users=db_get("Users"); match=users[(users['Username']==u)&(users['Password']==p)]
-                if not match.empty:
-                    st.session_state['auth']=True; st.session_state['username']=u; st.session_state['role']=match.iloc[0]['Role']
-                    if 'ProfilePic' in match.columns and str(match.iloc[0]['ProfilePic']).startswith('http'):
-                        st.session_state['user_pic'] = match.iloc[0]['ProfilePic']
-                    st.query_params["user"]=u; st.query_params["role"]=match.iloc[0]['Role']; st.rerun()
-                else: st.error("Invalid")
+                users=db_get("Users")
+                input_hash = hash_password(p)
+                
+                user_match = users[users['Username'].astype(str).str.strip().str.lower() == u.lower()]
+                success = False
+                
+                if not user_match.empty:
+                    stored_pass = str(user_match.iloc[0]['Password']).strip()
+                    if stored_pass == input_hash:
+                        success = True
+                    elif stored_pass == p: 
+                        # Migration Step: If password was plain text, secretly hash it for them in DB
+                        db_update_user(user_match.iloc[0]['Username'], None, p, None)
+                        success = True
+
+                if success:
+                    st.session_state['auth']=True; st.session_state['username']=user_match.iloc[0]['Username']; st.session_state['role']=user_match.iloc[0]['Role']
+                    if 'ProfilePic' in user_match.columns and str(user_match.iloc[0]['ProfilePic']).startswith('http'):
+                        st.session_state['user_pic'] = user_match.iloc[0]['ProfilePic']
+                    st.query_params["user"]=user_match.iloc[0]['Username']; st.query_params["role"]=user_match.iloc[0]['Role']; st.rerun()
+                else: st.error("Invalid Credentials")
             card_end()
         return
 
-    # Sidebar
+    # Sidebar (WHATSAPP STYLE DP FROM DRIVE)
     with st.sidebar:
-        if st.session_state.get('user_pic'): st.image(st.session_state['user_pic'], width=100)
-        else: st.image(LOGO_PATH, width=80) if os.path.exists(LOGO_PATH) else None
-        st.write(f"👤 **{st.session_state['username']}**"); st.divider()
+        if st.session_state.get('user_pic'): 
+            st.markdown(f'<img src="{st.session_state["user_pic"]}" class="profile-pic">', unsafe_allow_html=True)
+        else: 
+            if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=80)
+            else: st.markdown(f'<div style="display:flex;justify-content:center;font-size:80px;">👤</div>', unsafe_allow_html=True)
+        
+        st.markdown(f"<h3 style='text-align: center;'>{st.session_state['username']}</h3>", unsafe_allow_html=True)
+        st.divider()
         opts=["Dashboard", "Raise Debit Note", "My Profile"]
         if st.session_state['role']=="Admin": opts+=["Contractors", "User Management"]
         sel=option_menu("Nav", opts, icons=['grid', 'file-text', 'person-circle', 'building', 'people'])
         if st.button("Logout"): st.session_state['auth']=False; st.query_params.clear(); st.rerun()
 
-    # --- DASHBOARD (WITH CHARTS & TOOLS) ---
+    # --- DASHBOARD (WITH PAGINATION) ---
     if sel == "Dashboard":
         st.title("Dashboard")
         df = db_get("DebitNotes"); cons = db_get("Contractors")
@@ -307,12 +399,10 @@ def main():
             m1, m2, m3 = st.columns(3)
             m1.metric("Total", f"₹{df['Amount'].sum():,.0f}"); m2.metric("Count", len(df)); m3.metric("Last", df['Date'].max())
             
-            # --- RESTORED CHARTS ---
             c1, c2 = st.columns(2)
             with c1: card_start(); st.subheader("Category Breakdown"); st.bar_chart(df.groupby('Category')['Amount'].sum() if 'Category' in df.columns else []); card_end()
             with c2: card_start(); st.subheader("Top Contractors"); st.bar_chart(df.groupby('Contractor Name')['Amount'].sum()); card_end()
             
-            # --- FILTER ---
             card_start()
             c1, c2 = st.columns([2, 1])
             con_options = ["All"] + cons['Name'].tolist() if not cons.empty else ["All"]
@@ -321,9 +411,17 @@ def main():
             df = df.sort_values(by="Date", ascending=False)
             card_end()
             
-            # --- LIST WITH DELETE ---
+            # --- PAGINATION LOGIC ---
             st.subheader("Records")
-            for i, row in df.iterrows():
+            if 'page_number' not in st.session_state: st.session_state.page_number = 0
+            items_per_page = 5
+            total_pages = max(1, math.ceil(len(df) / items_per_page))
+            if st.session_state.page_number >= total_pages: st.session_state.page_number = total_pages - 1
+            
+            start_idx = st.session_state.page_number * items_per_page
+            df_page = df.iloc[start_idx : start_idx + items_per_page]
+            
+            for i, row in df_page.iterrows():
                 with st.expander(f"{row['Date']} | {row['Contractor Name']} | ₹{row['Amount']}"):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"**Reason:** {row['Reason']}")
@@ -332,7 +430,17 @@ def main():
                         if c2.button("🗑️ Delete", key=f"del_{row['ID']}"):
                             if db_delete_row("DebitNotes", "ID", row['ID']): st.success("Deleted!"); time.sleep(1); st.rerun()
 
-        # --- BULK MERGE TOOL ---
+            # Pagination Controls UI
+            if total_pages > 1:
+                st.markdown("---")
+                pc1, pc2, pc3 = st.columns([1, 2, 1])
+                if pc1.button("⬅️ Previous", disabled=(st.session_state.page_number == 0)):
+                    st.session_state.page_number -= 1; st.rerun()
+                pc2.markdown(f"<div style='text-align: center; margin-top:10px;'>Page {st.session_state.page_number + 1} of {total_pages}</div>", unsafe_allow_html=True)
+                if pc3.button("Next ➡️", disabled=(st.session_state.page_number == total_pages - 1)):
+                    st.session_state.page_number += 1; st.rerun()
+
+        # Tools Block
         st.markdown("---")
         if st.button("📥 Download Tools (Statement / Merge)"): st.session_state['show_gen'] = True
         if st.session_state.get('show_gen'):
@@ -363,23 +471,45 @@ def main():
     # --- MY PROFILE ---
     elif sel == "My Profile":
         st.title("My Profile"); card_start()
-        with st.form("prof_up"):
-            new_user = st.text_input("Username", value=st.session_state['username'])
-            new_pass = st.text_input("New Password (Leave blank to keep)", type="password")
-            pic_file = st.file_uploader("Update Profile Photo", type=['jpg', 'png'])
-            if st.form_submit_button("Update Profile"):
-                pic_link = None
-                if pic_file: cp = compress_image(pic_file); pic_link = upload_to_drive(cp, f"profile_{new_user}.jpg", "image/jpeg")
-                if db_update_user(st.session_state['username'], new_user, new_pass, pic_link):
-                    st.success("Updated! Re-login required."); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
-                else: st.error("Update Failed")
+        
+        # Display Current Photo WhatsApp Style
+        if st.session_state.get('user_pic'):
+            st.markdown(f'<div style="display:flex;justify-content:center;"><img src="{st.session_state["user_pic"]}" style="border-radius:50%;width:150px;height:150px;object-fit:cover;"></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div style="display:flex;justify-content:center;font-size:100px;">👤</div>', unsafe_allow_html=True)
+        
+        st.markdown(f"<h2 style='text-align: center;'>{st.session_state['username']}</h2>", unsafe_allow_html=True)
+        st.divider()
+
+        st.write("📸 **Update Profile Photo**")
+        pic_file = st.file_uploader("Upload New Image", type=['jpg', 'png'])
+        cropped_img = None
+        if pic_file:
+            st.caption("Adjust box to crop face:")
+            cropped_img = st_cropper(Image.open(pic_file), aspect_ratio=1, box_color='#0000FF', key='crop')
+            st.caption("Preview:")
+            st.image(cropped_img, width=150)
+        
+        st.divider()
+        st.write("✏️ **Edit Details**")
+        new_user = st.text_input("Username", value=st.session_state['username'])
+        new_pass = st.text_input("New Password", type="password")
+
+        if st.button("💾 Save Profile Changes"):
+            new_pic_link = None
+            if cropped_img: # Uses the new Drive logic
+                new_pic_link = save_profile_pic_drive(cropped_img, st.session_state['username'])
+            
+            if db_update_user(st.session_state['username'], new_user, new_pass, new_pic_link):
+                st.success("Updated Successfully!"); time.sleep(2); st.session_state['auth'] = False; st.query_params.clear(); st.rerun()
+            else: st.error("Update Failed")
         card_end()
 
-    # --- RAISE DEBIT NOTE ---
+    # --- RAISE DEBIT NOTE (WITH WHATSAPP DISPATCH) ---
     elif sel == "Raise Debit Note":
         st.title("Raise Debit Note"); card_start()
         st.write("🎙️ **Voice Description** (Record -> Speak -> Stop)")
-        audio = mic_recorder(start_prompt="Record", stop_prompt="Stop", key='recorder')
+        audio = mic_recorder(start_prompt="Record", stop_prompt="Stop", key='recorder', format='wav')
         if audio: st.session_state['voice_text'] = transcribe_audio(audio['bytes']); st.success("Audio captured!")
 
         with st.form("dn_form"):
@@ -400,7 +530,7 @@ def main():
             
             st.markdown("---"); st.write("**✍️ Signature**"); sig_file = st.file_uploader("Upload Sig", type=['png', 'jpg'], key="sig_up")
             
-            if st.form_submit_button("Submit & Email"):
+            if st.form_submit_button("Submit Note"):
                 imgs, links = [], []
                 for b in st.session_state['cam_buffer']: cp = compress_image(b); imgs.append(cp); links.append(upload_to_drive(cp, "cam.jpg", "image/jpeg"))
                 if files:
@@ -409,19 +539,30 @@ def main():
                 data = {"contractor": con, "date": str(dt), "amount": amt, "category": cat, "reason": reason, "site": site, "local_img_paths": imgs, "signature_path": sig_path}
                 pdf_path = create_pdf("receipt", data); pdf_link = upload_to_drive(pdf_path, os.path.basename(pdf_path), "application/pdf")
                 db_insert("DebitNotes", [int(datetime.now().timestamp()), con, str(dt), amt, cat, reason, site, ",".join(links), pdf_link, st.session_state['username']])
+                
+                # Notification Dispatch Block
                 con_row = cons[cons['Name'] == con]
-                if not con_row.empty and 'Email' in con_row.columns and str(con_row.iloc[0]['Email']) != "":
-                    send_email_with_pdf([con_row.iloc[0]['Email']], f"Debit Note - {con}", f"Debit Note Raised (INR {amt})", pdf_path); st.toast("Email sent")
+                if not con_row.empty:
+                    # Dispatch Email
+                    if 'Email' in con_row.columns and str(con_row.iloc[0]['Email']).strip() != "":
+                        send_email_with_pdf([con_row.iloc[0]['Email']], f"Debit Note - {con}", f"Debit Note Raised (INR {amt})", pdf_path)
+                    
+                    # Dispatch WhatsApp
+                    if 'Phone' in con_row.columns and str(con_row.iloc[0]['Phone']).strip() != "":
+                        wa_msg = f"Alert from GP Group:\nA Debit Note of INR {amt} has been raised for site {site}.\nReason: {reason}\nEngineer: {st.session_state['username']}"
+                        send_whatsapp(str(con_row.iloc[0]['Phone']).strip(), wa_msg)
+
+                st.toast("Submitted Successfully!")
                 st.session_state['cam_buffer'] = []; reset_form(); time.sleep(1); st.rerun()
         card_end()
 
-    # --- ADMIN PAGES ---
+    # --- ADMIN PAGES (SECURE) ---
     elif sel == "Contractors" and st.session_state['role'] == "Admin":
         st.title("Contractors"); c1, c2 = st.columns([1, 2])
         with c1:
             with st.form("add_c"):
-                n = st.text_input("Name"); e = st.text_input("Email"); d = st.text_input("Details")
-                if st.form_submit_button("Add"): db_insert("Contractors", [int(datetime.now().timestamp()), n, d, e]); st.rerun()
+                n = st.text_input("Name"); e = st.text_input("Email"); d = st.text_input("Details"); p = st.text_input("Phone Number (WhatsApp)")
+                if st.form_submit_button("Add"): db_insert("Contractors", [int(datetime.now().timestamp()), n, d, e, p]); st.rerun()
         with c2: st.dataframe(db_get("Contractors"), use_container_width=True)
 
     elif sel == "User Management" and st.session_state['role'] == "Admin":
@@ -429,8 +570,15 @@ def main():
         with c1:
             with st.form("add_u"):
                 u = st.text_input("User"); p = st.text_input("Pass", type="password"); r = st.selectbox("Role", ["Engineer", "Admin"])
-                if st.form_submit_button("Add"): db_insert("Users", [u, p, r]); st.rerun()
-        with c2: st.dataframe(db_get("Users"), use_container_width=True)
+                if st.form_submit_button("Add"): 
+                    db_insert("Users", [u, hash_password(p), r, ""]) # Hash on creation
+                    st.success("User Added!"); time.sleep(1); st.rerun()
+        with c2: 
+            users_df = db_get("Users")
+            if not users_df.empty:
+                # Security: Drop Password column before rendering to UI
+                safe_df = users_df.drop(columns=["Password"], errors='ignore')
+                st.dataframe(safe_df, use_container_width=True)
 
 if __name__ == "__main__":
     main()
